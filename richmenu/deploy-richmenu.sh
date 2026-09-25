@@ -25,10 +25,46 @@ echo "▶ เรนเดอร์รูปเมนู…"
   --window-size=2500,1686 --screenshot=richmenu.png "file://$PWD/menu.html" 2>/dev/null
 echo "  รูปขนาด $(du -h richmenu.png | cut -f1)"
 
-echo "▶ สร้างริชเมนูใหม่…"
-NEW_ID=$(curl -s -X POST https://api.line.me/v2/bot/richmenu \
+PAYLOAD=$(sed "s/__LIFF_ID__/$LIFF_ID/g" richmenu.json)
+
+# ตรวจข้อความไทยและความยาวก่อนส่ง เพื่อไม่ให้ LINE ตอบ 400 แล้วเดาเองว่าสาเหตุคืออะไร
+python3 - "$PAYLOAD" <<'PY'
+import json, re, sys
+data = json.loads(sys.argv[1])
+# อักขระยุโรปที่เหลือคือสัญญาณว่าไฟล์ถูกอ่านผิด encoding (เช่น à¹€à¸Šà¸‡à¸)
+if re.search(r'[\u00c0-\u00ff]', json.dumps(data, ensure_ascii=False)):
+    sys.exit('หยุด: ข้อความใน richmenu.json เพี้ยน ต้องอ่านไฟล์เป็น UTF-8')
+bar = data['chatBarText']
+if len(bar) > 14:
+    sys.exit(f'หยุด: chatBarText "{bar}" ยาว {len(bar)} ตัวอักษร (LINE อนุญาต 14)')
+for area in data['areas']:
+    label = area['action'].get('label')
+    if label and len(label) > 20:
+        sys.exit(f'หยุด: ป้าย "{label}" ยาว {len(label)} ตัวอักษร (LINE อนุญาต 20)')
+print(f'  ✓ ข้อความถูกต้อง: "{bar}" ({len(bar)} ตัวอักษร)')
+PY
+
+echo "▶ ตรวจสอบกับ LINE ก่อน…"
+VALIDATE=$(curl -s -w '\n%{http_code}' -X POST https://api.line.me/v2/bot/richmenu/validate \
   -H "$AUTH" -H 'content-type: application/json' \
-  -d "$(sed "s/__LIFF_ID__/$LIFF_ID/g" richmenu.json)" |
+  --data-binary "$PAYLOAD")
+if [ "$(printf '%s' "$VALIDATE" | tail -n1)" != "200" ]; then
+  echo "หยุด: LINE ไม่รับเมนูนี้ —"
+  printf '%s\n' "$VALIDATE" | head -n -1
+  exit 1
+fi
+echo "  ✓ LINE ผ่านการตรวจสอบ"
+
+echo "▶ สร้างริชเมนูใหม่…"
+CREATE=$(curl -s -w '\n%{http_code}' -X POST https://api.line.me/v2/bot/richmenu \
+  -H "$AUTH" -H 'content-type: application/json' \
+  --data-binary "$PAYLOAD")
+if [ "$(printf '%s' "$CREATE" | tail -n1)" != "200" ]; then
+  echo "หยุด: สร้างริชเมนูไม่สำเร็จ —"
+  printf '%s\n' "$CREATE" | head -n -1
+  exit 1
+fi
+NEW_ID=$(printf '%s' "$CREATE" | head -n -1 |
   python3 -c 'import sys,json; print(json.load(sys.stdin)["richMenuId"])')
 echo "  $NEW_ID"
 
@@ -48,5 +84,17 @@ for OLD in $(curl -s https://api.line.me/v2/bot/richmenu/list -H "$AUTH" |
     echo "  ลบ $OLD"
   fi
 done
+
+# ยืนยันว่าข้อความที่ LINE เก็บตรงกับไฟล์จริง (กันปัญหาอักขระเพี้ยน)
+SAVED=$(curl -s "https://api.line.me/v2/bot/richmenu/$NEW_ID" -H "$AUTH")
+python3 - "$SAVED" "$PAYLOAD" <<'PY'
+import json, re, sys
+saved, sent = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+if re.search(r'[\u00c0-\u00ff]', json.dumps(saved, ensure_ascii=False)):
+    sys.exit('หยุด: LINE เก็บข้อความเพี้ยน อย่าใช้เมนูนี้')
+if saved['chatBarText'] != sent['chatBarText']:
+    sys.exit('หยุด: ข้อความบน LINE ไม่ตรงกับไฟล์')
+print(f'  ✓ ยืนยันบน LINE แล้ว: "{saved["chatBarText"]}"')
+PY
 
 echo "✅ เสร็จแล้ว — ปิดแล้วเปิดห้องแชทใหม่เพื่อดูเมนูล่าสุด"

@@ -72,7 +72,7 @@ function header(title: string, subtitle: string, color: string): Flex {
     paddingAll: '16px',
     paddingBottom: '14px',
     contents: [
-      { type: 'text', text: subtitle, size: 'xxs', color: '#FFFFFFCC', weight: 'bold' },
+      { type: 'text', text: subtitle, size: 'xxs', color: '#D0D5DD', weight: 'bold' },
       { type: 'text', text: title, size: 'lg', color: C.white, weight: 'bold', margin: 'xs', wrap: true },
     ],
   };

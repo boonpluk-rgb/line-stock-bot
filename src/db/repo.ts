@@ -101,8 +101,10 @@ export async function searchProducts(db: D1Database, query: string, limit = 20):
   const where: string[] = ['p.active = 1'];
   const binds: unknown[] = [];
   for (const t of terms) {
-    where.push('(LOWER(p.name) LIKE ? OR LOWER(p.sku) LIKE ? OR LOWER(p.category) LIKE ? OR p.barcode = ?)');
-    binds.push(`%${t}%`, `%${t}%`, `%${t}%`, t);
+    // ใช้ instr() แทน LIKE เพราะ D1 จำกัดความยาว pattern ของ LIKE ไว้ที่ 50 ตัวอักษร
+    // ถ้ายาวเกินจะ error "LIKE or GLOB pattern too complex" ทำให้บอทตอบไม่ได้
+    where.push('(instr(LOWER(p.name), ?) > 0 OR instr(LOWER(p.sku), ?) > 0 OR instr(LOWER(p.category), ?) > 0 OR p.barcode = ?)');
+    binds.push(t, t, t, t);
   }
   const sql = `
     SELECT p.*,
@@ -114,14 +116,14 @@ export async function searchProducts(db: D1Database, query: string, limit = 20):
       CASE WHEN LOWER(p.name) = ? THEN 0
            WHEN LOWER(p.sku)  = ? THEN 0
            WHEN p.barcode     = ? THEN 0
-           WHEN LOWER(p.name) LIKE ? THEN 1
+           WHEN instr(LOWER(p.name), ?) = 1 THEN 1
            ELSE 2 END,
       p.name
     LIMIT ?`;
   const q = norm(query);
   const { results } = await db
     .prepare(sql)
-    .bind(...binds, q, q, q, `${q}%`, limit)
+    .bind(...binds, q, q, q, q, limit)
     .all<ProductWithStock>();
   return results ?? [];
 }
@@ -135,9 +137,10 @@ export async function listProducts(
   const where: string[] = ['p.active = 1'];
 
   if (opts.q && opts.q.trim()) {
-    where.push('(LOWER(p.name) LIKE ? OR LOWER(p.sku) LIKE ? OR LOWER(p.category) LIKE ? OR p.barcode LIKE ?)');
-    const like = `%${norm(opts.q)}%`;
-    binds.push(like, like, like, like);
+    // instr() แทน LIKE — D1 จำกัด pattern ของ LIKE ไว้ 50 ตัวอักษร (ดู searchProducts)
+    where.push('(instr(LOWER(p.name), ?) > 0 OR instr(LOWER(p.sku), ?) > 0 OR instr(LOWER(p.category), ?) > 0 OR instr(p.barcode, ?) > 0)');
+    const term = norm(opts.q);
+    binds.push(term, term, term, term);
   }
 
   const qtyExpr = opts.locationId

@@ -8,6 +8,8 @@ const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const state = {
   config: null,
   idToken: null,
+  useLiff: false,
+  refreshing: null,
   me: null,
   tab: 'overview',
   products: [],
@@ -75,11 +77,62 @@ function toast(message, kind = '') {
   }, 2600);
 }
 
-async function api(path, options = {}) {
+/* --------------------------------------------------------- ID token */
+/* LIFF ออก ID token อายุ 30 นาที ถ้าเปิดหน้าเว็บทิ้งไว้นาน ๆ โทเคนที่เก็บไว้จะหมดอายุ
+   แก้โดย: ดึงโทเคนใหม่ก่อนส่งทุกคำขอ (ถ้าใกล้หมดอายุ) และถ้าเจอ 401 ให้รีเฟรชแล้วลองใหม่ 1 ครั้ง */
+
+function readDecodedToken() {
+  try {
+    return window.liff?.getDecodedIDToken?.() || null;
+  } catch {
+    return null;
+  }
+}
+
+async function refreshIdToken() {
+  if (!state.useLiff) return state.idToken;
+  if (state.refreshing) return state.refreshing;
+
+  state.refreshing = (async () => {
+    try {
+      if (typeof window.liff?.refresh === 'function') await window.liff.refresh();
+    } catch (err) {
+      console.warn('รีเฟรช ID token ไม่สำเร็จ', err);
+    }
+    state.idToken = window.liff?.getIDToken?.() || null;
+    return state.idToken;
+  })();
+
+  try {
+    return await state.refreshing;
+  } finally {
+    state.refreshing = null;
+  }
+}
+
+async function ensureFreshIdToken() {
+  if (!state.useLiff) return state.idToken;
+  const decoded = readDecodedToken();
+  // อ่านเวลาหมดอายุไม่ได้ — ใช้โทเคนปัจจุบันไปก่อน แล้วพึ่งการลองใหม่ตอนเจอ 401
+  if (!decoded || typeof decoded.exp !== 'number') return window.liff.getIDToken();
+  const msLeft = decoded.exp * 1000 - Date.now();
+  if (msLeft > 60_000) return window.liff.getIDToken();
+  return refreshIdToken();
+}
+
+async function api(path, options = {}, canRetry = true) {
   const headers = { 'content-type': 'application/json', ...(options.headers || {}) };
-  if (state.idToken) headers.authorization = `Bearer ${state.idToken}`;
+  const token = await ensureFreshIdToken();
+  if (token) headers.authorization = `Bearer ${token}`;
   const res = await fetch(`/api${path}`, { ...options, headers });
   const data = await res.json().catch(() => ({}));
+
+  // โทเคนหมดอายุระหว่างที่เปิดหน้าค้างไว้ — รีเฟรชแล้วลองใหม่ 1 ครั้ง
+  if (res.status === 401 && canRetry && state.useLiff) {
+    await refreshIdToken();
+    return api(path, options, false);
+  }
+
   if (!res.ok) {
     const error = new Error(data.error || `เกิดข้อผิดพลาด (${res.status})`);
     error.status = res.status;
@@ -96,6 +149,7 @@ async function boot() {
     state.config = await fetch('/api/config').then((r) => r.json());
     const local = ['localhost', '127.0.0.1'].includes(location.hostname);
     const useLiff = state.config.liffId && !(local && state.config.dev);
+    state.useLiff = Boolean(useLiff);
 
     if (useLiff) {
       await liff.init({ liffId: state.config.liffId });
@@ -1174,6 +1228,13 @@ $('#locationFilter').addEventListener('change', (e) => {
 
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !$('#sheet').hidden) closeSheet();
+});
+
+// กลับมาใช้แอปหลังพักนาน ๆ — เช็กโทเคนทันที จะได้ไม่เจอ "เซสชันหมดอายุ"
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && state.useLiff) {
+    ensureFreshIdToken().catch(() => {});
+  }
 });
 
 boot();

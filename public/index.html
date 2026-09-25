@@ -80,7 +80,10 @@
       </div>
 
       <div id="productList" class="list list--cards"></div>
-      <button class="btn btn--ghost btn--block" id="addProductBtn" type="button">+ เพิ่มสินค้าใหม่</button>
+      <div class="btn-stack">
+        <button class="btn btn--ghost btn--block" id="importProductBtn" type="button">📥 นำเข้าสินค้าจาก Excel / CSV</button>
+        <button class="btn btn--ghost btn--block" id="addProductBtn" type="button">+ เพิ่มสินค้าใหม่</button>
+      </div>
     </section>
 
     <!-- ประวัติ -->
@@ -116,6 +119,14 @@
           <code>ปรับ ปากกา 42 #นับสต๊อกประจำเดือน</code>
           <code>ใกล้หมด · ประวัติ · คลัง · สรุป</code>
         </div>
+      </div>
+
+      <div class="card">
+        <div class="card__head"><h2>QR Code สินค้า</h2></div>
+        <p style="margin:0 0 12px;color:var(--body);font-size:13px;line-height:1.6">
+          สร้าง QR ใหม่จากรหัสสินค้า (SKU) เพื่อใช้สแกนเปิดสินค้าได้ทันที
+        </p>
+        <button class="btn btn--ghost btn--block" id="qrPrintBtn" type="button">พิมพ์ QR สินค้าทั้งหมด</button>
       </div>
 
       <div class="card">

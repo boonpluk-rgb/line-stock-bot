@@ -15,6 +15,10 @@ const state = {
   filters: { q: '', status: 'all', locationId: '' },
   historyType: 'all',
   summary: null,
+  importFile: null,
+  importPreview: null,
+  importRunId: 0,
+  importBusy: false,
 };
 
 const ACTIONS = {
@@ -76,7 +80,12 @@ async function api(path, options = {}) {
   if (state.idToken) headers.authorization = `Bearer ${state.idToken}`;
   const res = await fetch(`/api${path}`, { ...options, headers });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `เกิดข้อผิดพลาด (${res.status})`);
+  if (!res.ok) {
+    const error = new Error(data.error || `เกิดข้อผิดพลาด (${res.status})`);
+    error.status = res.status;
+    error.data = data;
+    throw error;
+  }
   return data;
 }
 
@@ -474,6 +483,442 @@ async function openMovement(productId, action = 'issue') {
   });
 }
 
+/* -------------------------------------------------- นำเข้า Excel / CSV */
+
+const IMPORT_FIELDS = [
+  { key: 'sku', label: 'รหัสสินค้า (SKU) *', required: true, aliases: ['sku', 'รหัสสินค้า', 'รหัส', 'id', 'code', 'รหัสอุปกรณ์'] },
+  { key: 'name', label: 'ชื่อสินค้า *', required: true, aliases: ['name', 'ชื่อสินค้า', 'รายการอุปกรณ์', 'รายการ', 'สินค้า', 'product'] },
+  { key: 'category', label: 'หมวดหมู่', aliases: ['category', 'หมวดหมู่', 'หมวดหมู่อุปกรณ์', 'กลุ่มสินค้า'] },
+  { key: 'stock', label: 'จำนวนคงเหลือในคลัง *', required: true, aliases: ['stock', 'qty', 'quantity', 'จำนวนคงเหลือในคลัง', 'จำนวนคงเหลือ', 'ยอดคงเหลือ', 'คงเหลือ'] },
+  { key: 'min_qty', label: 'จุดสั่งซื้อขั้นต่ำ', aliases: ['minqty', 'reorder', 'จุดสั่งซื้อ', 'สั่งซื้อขั้นต่ำ', 'สั่งซื้อขั้นต่ำ20', 'ขั้นต่ำ'] },
+  { key: 'unit', label: 'หน่วยนับ', aliases: ['unit', 'หน่วย', 'หน่วยนับ'] },
+  { key: 'barcode', label: 'บาร์โค้ด (ถ้ามี)', aliases: ['barcode', 'บาร์โค้ด', 'qr', 'qrcode'] },
+  { key: 'note', label: 'หมายเหตุ (ถ้ามี)', aliases: ['note', 'remark', 'หมายเหตุ'] },
+];
+
+let xlsxLoaderPromise = null;
+let qrLibraryPromise = null;
+
+function importHeaderKey(value) {
+  return String(value ?? '')
+    .replace(/\uFEFF/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\u0e00-\u0e7f]+/g, '');
+}
+
+function guessImportMapping(headers) {
+  const keys = headers.map(importHeaderKey);
+  const mapping = {};
+  for (const field of IMPORT_FIELDS) {
+    const aliases = field.aliases.map(importHeaderKey).filter(Boolean);
+    let index = keys.findIndex((key) => aliases.includes(key));
+    if (index < 0 && field.key !== 'unit') {
+      index = keys.findIndex((key) => key && aliases.some((alias) => key.includes(alias) || alias.includes(key)));
+    }
+    // “ราคา/หน่วย” หรือ “ราคาต่อหน่วย” เป็นราคา ไม่ใช่หน่วยสินค้า
+    // จึงไม่ควรถูกเลือกเป็นคอลัมน์หน่วยนับโดยอัตโนมัติ
+    if (field.key === 'unit' && index >= 0 && /(?:ราคา|price|cost|มูลค่า)/i.test(keys[index])) index = -1;
+    mapping[field.key] = index >= 0 ? String(index) : '';
+  }
+  return mapping;
+}
+
+function parseCsv(text, delimiter = ',') {
+  const source = String(text ?? '').replace(/^\uFEFF/, '');
+  const rows = [];
+  let row = [];
+  let cell = '';
+  let quoted = false;
+
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i];
+    if (quoted) {
+      if (ch === '"' && source[i + 1] === '"') {
+        cell += '"';
+        i += 1;
+      } else if (ch === '"') {
+        quoted = false;
+      } else {
+        cell += ch;
+      }
+    } else if (ch === '"' && cell === '') {
+      quoted = true;
+    } else if (ch === delimiter) {
+      row.push(cell);
+      cell = '';
+    } else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && source[i + 1] === '\n') i += 1;
+      row.push(cell);
+      if (row.some((v) => String(v).trim() !== '')) rows.push(row);
+      row = [];
+      cell = '';
+    } else {
+      cell += ch;
+    }
+  }
+  if (cell !== '' || row.length) {
+    row.push(cell);
+    if (row.some((v) => String(v).trim() !== '')) rows.push(row);
+  }
+  return rows;
+}
+
+function detectCsvDelimiter(text) {
+  const line = String(text ?? '').split(/\r?\n/).find((v) => v.trim()) ?? '';
+  const candidates = [',', ';', '\t'];
+  return candidates.reduce((best, delimiter) => {
+    const count = line.split(delimiter).length;
+    return count > best.count ? { delimiter, count } : best;
+  }, { delimiter: ',', count: 0 }).delimiter;
+}
+
+function loadXlsxLibrary() {
+  if (window.XLSX) return Promise.resolve(window.XLSX);
+  if (xlsxLoaderPromise) return xlsxLoaderPromise;
+  xlsxLoaderPromise = new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js';
+    script.async = true;
+    script.onload = () => (window.XLSX ? resolve(window.XLSX) : reject(new Error('โหลดตัวอ่าน Excel ไม่สำเร็จ')));
+    script.onerror = () => reject(new Error('โหลดตัวอ่าน Excel ไม่สำเร็จ ตรวจสอบอินเทอร์เน็ตแล้วลองใหม่'));
+    document.head.appendChild(script);
+  }).catch((error) => {
+    xlsxLoaderPromise = null;
+    throw error;
+  });
+  return xlsxLoaderPromise;
+}
+
+async function readImportFile(file) {
+  if (!file) throw new Error('กรุณาเลือกไฟล์ก่อน');
+  if (file.size > 10 * 1024 * 1024) throw new Error('ไฟล์ใหญ่เกิน 10 MB กรุณาแบ่งไฟล์เป็นส่วน ๆ');
+  const extension = file.name.split('.').pop()?.toLowerCase();
+  let matrix;
+  let textMatrix = null;
+  if (extension === 'csv') {
+    const text = await file.text();
+    matrix = parseCsv(text, detectCsvDelimiter(text));
+  } else if (extension === 'xlsx' || extension === 'xls') {
+    const XLSX = await loadXlsxLibrary();
+    const workbook = XLSX.read(await file.arrayBuffer(), { type: 'array', cellDates: false });
+    const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+    if (!firstSheet) throw new Error('ไม่พบชีตข้อมูลในไฟล์ Excel');
+    matrix = XLSX.utils.sheet_to_json(firstSheet, { header: 1, defval: '', raw: true });
+    // อ่านซ้ำแบบ "ตามที่ Excel แสดง" ไว้ใช้กับคอลัมน์ข้อความ เช่น รหัสสินค้า
+    // เพราะแบบ raw จะทำให้ 000123 กลายเป็น 123 และตัวเลขยาว ๆ ถูกปัดเศษ
+    textMatrix = XLSX.utils.sheet_to_json(firstSheet, { header: 1, defval: '', raw: false });
+  } else {
+    throw new Error('รองรับเฉพาะไฟล์ .xlsx, .xls และ .csv');
+  }
+
+  matrix = matrix.map((row) => (Array.isArray(row) ? row : [row]));
+  if (textMatrix) textMatrix = textMatrix.map((row) => (Array.isArray(row) ? row : [row]));
+  let headerIndex = matrix.findIndex((row) =>
+    row.some((cell) => {
+      const key = importHeaderKey(cell);
+      return IMPORT_FIELDS.some((field) => field.aliases.map(importHeaderKey).includes(key));
+    }),
+  );
+  if (headerIndex < 0) headerIndex = matrix.findIndex((row) => row.filter((cell) => String(cell ?? '').trim() !== '').length >= 2);
+  if (headerIndex < 0) throw new Error('ไม่พบหัวตารางในไฟล์');
+
+  const width = Math.max(...matrix.slice(headerIndex).map((row) => row.length), 0);
+  const headers = Array.from({ length: width }, (_, index) => String(matrix[headerIndex][index] ?? '').trim() || `คอลัมน์ ${index + 1}`);
+  const dataRows = matrix
+    .slice(headerIndex + 1)
+    .map((cells, index) => ({
+      cells,
+      textCells: textMatrix?.[headerIndex + 1 + index] ?? cells,
+      rowNumber: headerIndex + index + 2,
+    }))
+    .filter(({ cells }) => cells.some((cell) => String(cell ?? '').trim() !== ''));
+  if (!dataRows.length) throw new Error('ไม่พบรายการสินค้าในไฟล์');
+  return { fileName: file.name, headers, dataRows, mapping: guessImportMapping(headers) };
+}
+
+function invalidateImportPreview() {
+  state.importRunId += 1;
+  state.importPreview = null;
+  const result = $('#importResult');
+  if (result) result.innerHTML = '';
+  const commit = $('#importCommitBtn');
+  if (commit) {
+    commit.hidden = true;
+    commit.disabled = true;
+  }
+}
+
+function renderImportMapping(file) {
+  const box = $('#importMapping');
+  if (!box) return;
+  box.innerHTML = `
+    <h3>จับคู่คอลัมน์จากไฟล์</h3>
+    <p style="margin:0 0 10px;color:var(--body);font-size:12px">ตรวจชื่อคอลัมน์ให้ตรงกับข้อมูลด้านล่าง ถ้าชื่อไม่ตรงให้เลือกเองได้</p>
+    ${IMPORT_FIELDS.map((field) => {
+      const selected = file.mapping[field.key] ?? '';
+      return `<div class="field"><label>${field.label}</label>
+        <select data-import-map="${field.key}">
+          <option value="">— ไม่ใช้คอลัมน์นี้ —</option>
+          ${file.headers.map((header, index) => `<option value="${index}" ${String(selected) === String(index) ? 'selected' : ''}>${esc(header)}</option>`).join('')}
+        </select>
+      </div>`;
+    }).join('')}`;
+  $$('[data-import-map]', box).forEach((select) => select.addEventListener('change', (event) => {
+    file.mapping[event.target.dataset.importMap] = event.target.value;
+    invalidateImportPreview();
+  }));
+}
+
+function buildImportRows() {
+  const file = state.importFile;
+  if (!file) throw new Error('กรุณาเลือกไฟล์ก่อน');
+  for (const field of IMPORT_FIELDS.filter((item) => item.required)) {
+    if (file.mapping[field.key] === '') throw new Error(`กรุณาเลือกคอลัมน์${field.label.replace(' *', '')}`);
+  }
+  const cell = (row, key) => {
+    const index = file.mapping[key];
+    if (index === '' || index === undefined) return '';
+    const at = Number(index);
+    return row[at] ?? '';
+  };
+  // คอลัมน์ข้อความใช้ค่าแบบที่ Excel แสดง (กันเลข 0 นำหน้าหาย)
+  // คอลัมน์จำนวนใช้ค่าตัวเลขดิบ เพื่อไม่ให้เศษทศนิยมคลาดเคลื่อน
+  return file.dataRows.map(({ cells, textCells, rowNumber }) => ({
+    rowNumber,
+    sku: String(cell(textCells, 'sku')).trim(),
+    name: String(cell(textCells, 'name')).trim(),
+    category: String(cell(textCells, 'category')).trim(),
+    stock_qty: cell(cells, 'stock'),
+    min_qty: cell(cells, 'min_qty'),
+    unit: String(cell(textCells, 'unit')).trim(),
+    barcode: String(cell(textCells, 'barcode')).trim(),
+    note: String(cell(textCells, 'note')).trim(),
+  }));
+}
+
+function importActionMeta(action) {
+  return {
+    create: { label: 'เพิ่มใหม่', cls: 'ok' },
+    update: { label: 'อัปเดต', cls: 'warn' },
+    unchanged: { label: 'ไม่เปลี่ยน', cls: 'muted' },
+    skip: { label: 'ข้าม', cls: 'muted' },
+    error: { label: 'ผิดพลาด', cls: 'danger' },
+  }[action] ?? { label: action, cls: 'muted' };
+}
+
+function renderImportPreview(plan) {
+  const box = $('#importResult');
+  if (!box) return;
+  state.importPreview = plan;
+  const s = plan.summary;
+  const summaryCard = (label, value, cls = '') => `<div class="import-stat ${cls}"><b>${fmt(value)}</b><span>${label}</span></div>`;
+  const rows = plan.rows;
+  box.innerHTML = `
+    <div class="import-result-head">
+      <h3>ผลตรวจแบบยังไม่บันทึก (Dry-run)</h3>
+      <p>ตรวจข้อมูลกับคลัง <b>${esc(plan.location.name)}</b> แล้ว ยังไม่มีการเปลี่ยนแปลงข้อมูลจริง</p>
+    </div>
+    <div class="import-summary">
+      ${summaryCard('เพิ่มใหม่', s.createCount, 'is-ok')}
+      ${summaryCard('อัปเดต', s.updateCount, 'is-warn')}
+      ${summaryCard('ไม่เปลี่ยน', s.unchangedCount)}
+      ${summaryCard('ข้าม', s.skippedCount)}
+      ${summaryCard('ผิดพลาด', s.errorCount, 'is-danger')}
+      ${summaryCard('แก้รหัสซ้ำ', s.renamedCount)}
+      ${summaryCard('ยอดรวมที่จะตั้ง', s.totalTargetQty, 'is-total')}
+    </div>
+    <div class="import-note">ยอดว่างในไฟล์จะถือเป็น 0 · แถวสรุปที่ไม่มีรหัสและชื่อสินค้าจะขึ้นเป็น “ข้าม” · ยอดของสินค้าเดิมจะถูก “ตั้งค่าตามไฟล์” ไม่ใช่บวกซ้ำ · ราคาไม่ได้นำเข้าเพราะระบบยังไม่มีช่องเก็บราคา</div>
+    <div class="import-table-wrap">
+      <table class="import-table">
+        <thead><tr><th>แถว</th><th>SKU ที่จะใช้</th><th>ชื่อสินค้า</th><th>ผลลัพธ์</th><th>ยอด</th><th>เหตุผล</th></tr></thead>
+        <tbody>${rows.map((row) => {
+          const meta = importActionMeta(row.action);
+          const delta = Number(row.delta) || 0;
+          const qtyText = row.action === 'create'
+            ? `ยกมา ${fmt(row.stockQty)}`
+            : row.action === 'update' && Math.abs(delta) > 0.000001
+              ? `${delta > 0 ? '+' : ''}${fmt(delta)} → ${fmt(row.stockQty)}`
+              : fmt(row.stockQty);
+          return `<tr class="import-row--${row.action}">
+            <td>${row.rowNumber}</td>
+            <td class="mono">${esc(row.sku || '—')}${row.renamed ? `<small>เดิม: ${esc(row.inputSku)}</small>` : ''}</td>
+            <td>${esc(row.name || '—')}</td>
+            <td><span class="import-status import-status--${meta.cls}">${meta.label}</span></td>
+            <td class="mono">${qtyText}</td>
+            <td>${esc(row.reason || '—')}</td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table>
+    </div>
+    <div class="btn-grid" style="margin-top:14px">
+      <button class="btn btn--ghost" type="button" data-import-edit>กลับไปแก้ไฟล์</button>
+      <button class="btn btn--primary" type="button" id="importCommitBtn" ${plan.canCommit ? '' : 'disabled'}>ยืนยันนำเข้าจริง</button>
+    </div>
+    ${plan.canCommit ? '' : '<div class="import-error-note">มีรายการผิดพลาด ระบบจะไม่บันทึกทั้งไฟล์ กรุณาแก้ไขและตรวจสอบใหม่</div>'}`;
+  $('[data-import-edit]')?.addEventListener('click', () => {
+    invalidateImportPreview();
+    $('#importPreviewBtn')?.focus();
+  });
+}
+
+async function openProductImport() {
+  if (!state.locations.length) {
+    toast('ยังไม่มีคลังสินค้า กรุณาสร้างคลังในหน้าตั้งค่าก่อน', 'error');
+    return;
+  }
+  const defaultLocation = state.locations.find((location) => location.is_default) ?? state.locations[0];
+  state.importFile = null;
+  state.importPreview = null;
+  openSheet(`
+    ${sheetHead('นำเข้าสินค้าจากไฟล์', 'รองรับ Excel (.xlsx/.xls) และ CSV • ไม่เกิน 1,000 แถวต่อครั้ง')}
+    <div class="import-help">
+      <b>ขั้นตอน:</b> เลือกไฟล์ → ตรวจชื่อคอลัมน์ → ดูผลตรวจ → กดยืนยันบันทึกจริง
+      <br><span>ระบบจะไม่บันทึกทันทีจนกว่าคุณจะกด “ยืนยันนำเข้าจริง” และถ้ามีข้อผิดพลาดจะไม่บันทึกค้างไว้เพียงบางส่วน</span>
+    </div>
+    <div class="field"><label>ไฟล์ข้อมูล *</label><input id="importFileInput" type="file" accept=".xlsx,.xls,.csv" /></div>
+    <div id="importFileInfo" class="import-file-info">ยังไม่ได้เลือกไฟล์</div>
+    <div id="importMapping"></div>
+    <div class="field"><label>นำยอดไปเก็บที่คลัง *</label><select id="importLocation">${state.locations.map((location) => `<option value="${location.id}" ${location.id === defaultLocation.id ? 'selected' : ''}>${esc(location.name)} (${esc(location.code)})</option>`).join('')}</select></div>
+    <div class="field"><label>ถ้ารหัสสินค้าซ้ำในไฟล์</label><select id="importDuplicatePolicy"><option value="suffix">เติม -2, -3 ต่อท้าย (แนะนำ)</option><option value="skip">ข้ามรายการซ้ำ</option><option value="error">หยุดและให้แก้ไฟล์</option></select></div>
+    <button class="btn btn--primary btn--block" id="importPreviewBtn" type="button" disabled>ตรวจสอบก่อนนำเข้า</button>
+    <div id="importResult"></div>
+  `);
+
+  const fileInput = $('#importFileInput');
+  const previewButton = $('#importPreviewBtn');
+  fileInput.addEventListener('change', async () => {
+    const file = fileInput.files?.[0];
+    if (!file) return;
+    previewButton.disabled = true;
+    // invalidateImportPreview() ทำเลขรอบใหม่ให้แล้ว จึงเก็บค่านี้ไว้เทียบตอนผลกลับมา
+    invalidateImportPreview();
+    const runId = state.importRunId;
+    $('#importFileInfo').textContent = 'กำลังอ่านไฟล์…';
+    try {
+      const parsed = await readImportFile(file);
+      if (runId !== state.importRunId) return;
+      state.importFile = parsed;
+      const mapping = parsed.mapping;
+      const missing = IMPORT_FIELDS.filter((field) => field.required && mapping[field.key] === '').map((field) => field.label.replace(' *', ''));
+      $('#importFileInfo').textContent = `${file.name} · พบ ${fmt(parsed.dataRows.length)} แถว · ${parsed.headers.length} คอลัมน์`;
+      renderImportMapping(parsed);
+      previewButton.disabled = false;
+      if (missing.length) toast(`กรุณาเลือกคอลัมน์เพิ่มเติม: ${missing.join(', ')}`, 'error');
+    } catch (error) {
+      if (runId !== state.importRunId) return;
+      state.importFile = null;
+      $('#importFileInfo').textContent = 'อ่านไฟล์ไม่สำเร็จ';
+      $('#importMapping').innerHTML = '';
+      toast(error.message, 'error');
+    }
+  });
+  $('#importLocation').addEventListener('change', invalidateImportPreview);
+  $('#importDuplicatePolicy').addEventListener('change', invalidateImportPreview);
+  previewButton.addEventListener('click', async () => {
+    state.importRunId += 1;
+    const runId = state.importRunId;
+    previewButton.disabled = true;
+    previewButton.textContent = 'กำลังตรวจสอบ…';
+    try {
+      const payload = {
+        rows: buildImportRows(),
+        locationId: Number($('#importLocation').value),
+        duplicatePolicy: $('#importDuplicatePolicy').value,
+        filename: state.importFile.fileName,
+      };
+      const plan = await api('/products/import/preview', { method: 'POST', body: JSON.stringify(payload) });
+      if (runId !== state.importRunId) return;
+      renderImportPreview(plan);
+      previewButton.textContent = 'ตรวจสอบใหม่';
+    } catch (error) {
+      if (runId !== state.importRunId) return;
+      toast(error.message, 'error');
+    } finally {
+      if (runId === state.importRunId) previewButton.disabled = false;
+    }
+  });
+}
+
+async function commitProductImportFromSheet() {
+  if (!state.importPreview?.canCommit || !state.importPreview.token) return;
+  const button = $('#importCommitBtn');
+  if (!button) return;
+  const s = state.importPreview.summary;
+  if (!confirm(`ยืนยันนำเข้าจริง ${fmt(s.createCount + s.updateCount)} รายการ\nเข้าคลัง ${state.importPreview.location.name}\nยอดรวมที่ตั้ง ${fmt(s.totalTargetQty)} หน่วย\n\nถ้ามีข้อผิดพลาด ระบบจะยกเลิกทั้งไฟล์ ไม่บันทึกค้างไว้บางส่วน`)) return;
+  button.disabled = true;
+  button.textContent = 'กำลังบันทึกทั้งไฟล์…';
+  try {
+    const result = await api('/products/import', {
+      method: 'POST',
+      body: JSON.stringify({ token: state.importPreview.token }),
+    });
+    closeSheet();
+    toast(`นำเข้าสำเร็จ ${fmt(result.created + result.updated)} รายการ · เลขที่ ${result.ref ?? 'ไม่มีการเปลี่ยนแปลง'}`, 'ok');
+    await refreshAll();
+  } catch (error) {
+    toast(error.message, 'error');
+    button.disabled = false;
+    button.textContent = 'ยืนยันนำเข้าจริง';
+  }
+}
+
+/* --------------------------------------------------------- พิมพ์ QR ใหม่ */
+
+function loadQrLibrary() {
+  if (window.qrcode) return Promise.resolve(window.qrcode);
+  if (qrLibraryPromise) return qrLibraryPromise;
+  qrLibraryPromise = new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js';
+    script.async = true;
+    script.onload = () => (window.qrcode ? resolve(window.qrcode) : reject(new Error('โหลดไลบรารี QR ไม่สำเร็จ')));
+    script.onerror = () => reject(new Error('โหลดไลบรารี QR ไม่สำเร็จ ตรวจสอบอินเทอร์เน็ตแล้วลองใหม่'));
+    document.head.appendChild(script);
+  }).catch((error) => {
+    qrLibraryPromise = null;
+    throw error;
+  });
+  return qrLibraryPromise;
+}
+
+async function openQrPrint() {
+  openSheet(`${sheetHead('กำลังเตรียม QR…', 'กำลังดึงรายการสินค้า')}<div class="skeleton" style="height:120px"></div>`);
+  try {
+    const QR_PAGE_LIMIT = 1000;
+    const products = await api(`/products?limit=${QR_PAGE_LIMIT}`);
+    if (!products.length) {
+      toast('ยังไม่มีสินค้าให้สร้าง QR', 'error');
+      closeSheet();
+      return;
+    }
+    const qrcode = await loadQrLibrary();
+    const truncated = products.length >= QR_PAGE_LIMIT;
+    openSheet(`
+      ${sheetHead('พิมพ์ QR สินค้า', `สร้างจาก SKU จำนวน ${fmt(products.length)} รายการ`)}
+      <div class="qr-toolbar"><button class="btn btn--primary" id="printQrBtn" type="button">พิมพ์ / บันทึกเป็น PDF</button><span>QR จะเก็บเฉพาะรหัสสินค้า และสร้างบนเครื่องนี้</span></div>
+      ${truncated ? `<div class="import-error-note">สินค้ามีมากกว่า ${fmt(QR_PAGE_LIMIT)} รายการ หน้านี้แสดงเฉพาะ ${fmt(QR_PAGE_LIMIT)} รายการแรก หากต้องการพิมพ์ทั้งหมดให้พิมพ์ทีละช่วงโดยใช้ช่องค้นหาเพื่อกรองก่อน</div>` : ''}
+      <div class="qr-grid" id="qrGrid"></div>
+    `);
+    const grid = $('#qrGrid');
+    for (let i = 0; i < products.length; i += 1) {
+      const product = products[i];
+      const label = document.createElement('div');
+      label.className = 'qr-label';
+      label.innerHTML = `<div class="qr-label__name">${esc(product.name)}</div><div class="qr-label__code mono">${esc(product.sku)}</div><div class="qr-label__image"></div>`;
+      grid.appendChild(label);
+      const qr = qrcode(0, 'M');
+      qr.addData(product.sku);
+      qr.make();
+      label.querySelector('.qr-label__image').innerHTML = qr.createSvgTag(4, 2);
+      if (i % 25 === 24) await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    $('#printQrBtn').addEventListener('click', () => window.print());
+  } catch (error) {
+    toast(error.message, 'error');
+    closeSheet();
+  }
+}
+
 /* ------------------------------------------------------ ฟอร์มสินค้า */
 
 function openProductForm(product = null) {
@@ -603,14 +1048,16 @@ function openLocationForm(location = null) {
 
 async function scan() {
   try {
-    if (window.liff?.isInClient?.() && liff.scanCodeV2) {
-      const result = await liff.scanCodeV2();
+    const canScan = window.liff?.isApiAvailable?.('scanCodeV2')
+      || (window.liff?.isInClient?.() && window.liff?.scanCodeV2);
+    if (canScan && window.liff?.scanCodeV2) {
+      const result = await window.liff.scanCodeV2();
       return result?.value ?? null;
     }
   } catch (err) {
     console.warn('scanCodeV2 failed', err);
   }
-  const manual = prompt('กรอกบาร์โค้ด (อุปกรณ์นี้เปิดกล้องสแกนผ่าน LINE ไม่ได้)');
+  const manual = prompt('กรอกรหัสสินค้า หรือข้อความ QR (อุปกรณ์นี้เปิดกล้องสแกนผ่าน LINE ไม่ได้)');
   return manual?.trim() || null;
 }
 
@@ -620,8 +1067,16 @@ async function scanAndOpen() {
   try {
     const { product } = await api(`/products/lookup/${encodeURIComponent(code)}`);
     openProduct(product.id);
-  } catch {
-    if (confirm(`ไม่พบสินค้าบาร์โค้ด ${code}\nต้องการเพิ่มเป็นสินค้าใหม่หรือไม่?`)) {
+  } catch (error) {
+    if (error.status === 409) {
+      toast(error.message, 'error');
+      return;
+    }
+    if (error.status !== 404) {
+      toast(error.message || 'อ่าน QR ไม่สำเร็จ ลองใหม่อีกครั้ง', 'error');
+      return;
+    }
+    if (confirm(`ไม่พบสินค้าจาก QR หรือรหัส ${code}\nต้องการเพิ่มเป็นสินค้าใหม่หรือไม่?`)) {
       openProductForm();
       setTimeout(() => {
         const el = $('#productForm')?.barcode;
@@ -682,7 +1137,10 @@ document.addEventListener('click', (e) => {
   const loc = e.target.closest('[data-location]');
   if (loc) return openLocationForm(state.locations.find((l) => l.id === Number(loc.dataset.location)));
 
+  if (e.target.closest('#importProductBtn')) return openProductImport();
   if (e.target.closest('#addProductBtn')) return openProductForm();
+  if (e.target.closest('#qrPrintBtn')) return openQrPrint();
+  if (e.target.closest('#importCommitBtn')) return commitProductImportFromSheet();
   if (e.target.closest('#addLocationBtn')) return openLocationForm();
 
   const chip = e.target.closest('#statusChips .chip[data-status]');

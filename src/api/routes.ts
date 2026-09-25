@@ -69,15 +69,63 @@ api.get('/products', async (c) => {
   const q = c.req.query('q') ?? '';
   const locationId = c.req.query('locationId') ? Number(c.req.query('locationId')) : undefined;
   const status = (c.req.query('status') as 'all' | 'low' | 'out' | undefined) ?? 'all';
-  const products = await repo.listProducts(c.env.DB, { q, locationId, status, limit: 300 });
+  const requestedLimit = Number(c.req.query('limit') ?? 1000);
+  const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(Math.floor(requestedLimit), 1), 1000) : 1000;
+  const products = await repo.listProducts(c.env.DB, { q, locationId, status, limit });
   return c.json(products);
 });
 
 api.get('/products/lookup/:code', async (c) => {
-  const product = await repo.getProductByBarcode(c.env.DB, c.req.param('code'));
-  if (!product) return c.json({ error: 'ไม่พบสินค้าที่มีบาร์โค้ดนี้' }, 404);
-  const levels = await repo.getLevels(c.env.DB, product.id);
-  return c.json({ product, levels });
+  const lookup = await repo.lookupProductByScan(c.env.DB, c.req.param('code'));
+  if (!lookup.product) {
+    if (lookup.matchedBy === 'ambiguous') {
+      return c.json(
+        {
+          error: 'QR นี้ตรงกับสินค้ามากกว่าหนึ่งรายการ กรุณาค้นหาชื่อหรือรหัสสินค้าแทน',
+          candidates: lookup.candidates.map((p) => ({ id: p.id, sku: p.sku, name: p.name })),
+        },
+        409,
+      );
+    }
+    return c.json({ error: 'ไม่พบสินค้าที่มีรหัสหรือ QR นี้' }, 404);
+  }
+  const levels = await repo.getLevels(c.env.DB, lookup.product.id);
+  return c.json({ product: lookup.product, levels, matchedBy: lookup.matchedBy });
+});
+
+api.post('/products/import/preview', async (c) => {
+  // ป้องกันไม่ให้ส่งข้อมูลใหญ่เกินจนทำให้ Worker หรือ D1 รับไม่ไหว
+  const contentLength = Number(c.req.header('content-length') ?? 0);
+  if (contentLength > 4 * 1024 * 1024) {
+    throw new AppError('ไฟล์ใหญ่เกินไป กรุณาแบ่งไฟล์เป็นหลายชุดแล้วนำเข้าทีละชุด', 413);
+  }
+  const body = await c.req.json<{
+    rows?: unknown;
+    locationId?: number;
+    duplicatePolicy?: repo.ImportDuplicatePolicy;
+    filename?: string;
+  }>();
+  const user = c.get('user');
+  const plan = await repo.stageProductImport(
+    c.env.DB,
+    body.rows,
+    { locationId: Number(body.locationId), duplicatePolicy: body.duplicatePolicy },
+    { lineUserId: user.lineUserId, name: user.name, source: 'liff' },
+    body.filename,
+  );
+  return c.json(plan);
+});
+
+api.post('/products/import', async (c) => {
+  const body = await c.req.json<{ token?: unknown }>();
+  if (typeof body.token !== 'string' || !body.token.trim()) {
+    throw new AppError('ไม่พบรหัสยืนยันการนำเข้า กรุณาตรวจไฟล์ใหม่');
+  }
+  const user = c.get('user');
+  const result = await repo.commitStagedProductImport(c.env.DB, body.token.trim(), {
+    lineUserId: user.lineUserId, name: user.name, source: 'liff',
+  });
+  return c.json(result);
 });
 
 api.get('/products/:id', async (c) => {

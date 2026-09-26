@@ -154,7 +154,10 @@ async function boot() {
     if (useLiff) {
       await liff.init({ liffId: state.config.liffId });
       if (!liff.isLoggedIn()) {
-        liff.login({ redirectUri: location.href });
+        // ต้องใช้ที่อยู่ที่ลงทะเบียนไว้ใน LINE Developers Console เท่านั้น
+        // ถ้าใช้ location.href ตรง ๆ เบราว์เซอร์บางตัว (เช่น บนแท็บเล็ต) จะเติม `/` หรือ query
+        // ทำให้ไม่ตรงกับที่ลงทะเบียน → LINE ตอบ 400 Bad Request หน้าจอขาว
+        liff.login({ redirectUri: state.config.endpointUrl || location.origin });
         return;
       }
       state.idToken = liff.getIDToken();
@@ -169,11 +172,31 @@ async function boot() {
     $('#app').hidden = false;
     applyDeepLink();
   } catch (err) {
-    $('#boot').innerHTML = `
-      <div class="boot__logo">⚠️</div>
-      <div class="boot__text" style="max-width:280px;text-align:center">${esc(err.message)}</div>
-      <button class="btn btn--ghost" onclick="location.reload()">ลองใหม่</button>`;
+    showBootError(err);
   }
+}
+
+/* หน้าจอขาว/ข้อความยาว ๆ จาก LINE ไม่มีประโยชน์กับคนใช้งาน
+   เลยแปลงเป็นคำอธิบายสั้น ๆ ว่าจะทำอะไรต่อได้บ้าง */
+function showBootError(err) {
+  const liffId = state.config?.liffId;
+  const liffUrl = liffId ? `https://liff.line.me/${encodeURIComponent(liffId)}` : '';
+  const message = err?.message || 'เปิดหน้านี้ไม่สำเร็จ';
+  const hint = /login|token|liff|400|403|401/i.test(message)
+    ? 'การเข้าสู่ระบบผ่าน LINE ทำงานไม่สำเร็จ — ลองเปิดผ่านลิงก์ทางการด้านล่าง'
+    : message;
+
+  $('#boot').innerHTML = `
+    <div class="boot__logo">⚠️</div>
+    <div class="boot__text" style="max-width:320px;text-align:center">${esc(hint)}</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center">
+      ${liffUrl ? `<a class="btn" href="${esc(liffUrl)}">เปิดผ่านลิงก์ทางการ</a>` : ''}
+      <button class="btn btn--ghost" onclick="location.reload()">ลองใหม่</button>
+    </div>
+    <details style="max-width:320px;font-size:12px;color:var(--muted)">
+      <summary style="cursor:pointer">ดูรายละเอียดทางเทคนิค</summary>
+      <pre style="white-space:pre-wrap;text-align:left;margin-top:6px">${esc(message)}</pre>
+    </details>`;
 }
 
 function applyDeepLink() {

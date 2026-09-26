@@ -10,7 +10,13 @@ export const api = new Hono<Vars>();
 
 /* config เปิดสาธารณะ — หน้าเว็บต้องรู้ LIFF ID ก่อนจึงจะ init ได้ */
 api.get('/config', (c) =>
-  c.json({ liffId: c.env.LIFF_ID ?? '', dev: c.env.ENVIRONMENT === 'dev' }),
+  c.json({
+    liffId: c.env.LIFF_ID ?? '',
+    dev: c.env.ENVIRONMENT === 'dev',
+    // ที่อยู่เว็บต้นทาง (ไม่มี `/` ต่อท้าย) — ใช้เป็น redirectUri ตอน liff.login()
+    // ถ้าใช้ location.href ตรง ๆ เบราว์เซอร์บางตัวจะเติม `/` หรือพารามิเตอร์ ทำให้ LINE ตอบ 400 Bad Request
+    endpointUrl: new URL(c.req.url).origin,
+  }),
 );
 
 api.use('/*', requireAuth);

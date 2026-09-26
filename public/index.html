@@ -36,6 +36,32 @@
   <main class="content">
     <!-- ภาพรวม -->
     <section class="view" data-view="overview">
+      <!-- ผู้ดูแล: รายการรอจัด (วางบนสุด เพราะเป็นเรื่องด่วนที่สุด) -->
+      <div class="card" data-owner-only>
+        <div class="card__head">
+          <h2>รายการรอจัด</h2>
+          <span class="badge badge--adjust" id="reqCountBadge">0</span>
+        </div>
+        <p class="hint" id="reqHint" style="margin:0 0 12px">
+          พนักงานสั่งขอเบิกของมา → รายการจะทยอยมาที่นี่<br />
+          ส่งของให้แล้วกด <b>จัดแล้ว</b> ระบบจะตัดสต๊อกให้อัตโนมัติ
+        </p>
+        <div class="btn-stack" id="reqActions" style="margin:0 0 12px" hidden>
+          <button class="btn btn--primary btn--block" id="fulfillAllBtn" type="button">✅ จัดไปทั้งหมด</button>
+        </div>
+        <div id="requestList" class="list list--cards"><div class="skeleton"></div></div>
+      </div>
+
+      <!-- พนักงาน: คำขอของตัวเอง -->
+      <div class="card" id="myReqCard" hidden>
+        <div class="card__head">
+          <h2>คำขอของฉัน</h2>
+          <span class="badge" id="myReqBadge">0</span>
+        </div>
+        <p class="hint" style="margin:0 0 12px">คำขอที่ส่งไว้จะยังไม่ตัดสต๊อก จนกว่าผู้ดูแลจะกด "จัดแล้ว"</p>
+        <div id="myReqList" class="list list--cards"></div>
+      </div>
+
       <div class="stat-grid" id="statGrid"></div>
 
       <div class="card">

@@ -103,6 +103,28 @@ async function handleText(ctx: Ctx, raw: string): Promise<LineMessage[]> {
       return [F.summaryCard(s, liffUrl(env), ctx.role)];
     }
 
+    case 'myreq': {
+      if (!ctx.userId) return [F.text('คำขอส่วนนี้ต้องใช้ในแชทส่วนตัวครับ', true, ctx.role)];
+      const rows = await repo.listRequestsByUser(db, ctx.userId, 20);
+      return [F.requestsCard(rows, liffUrl(env), ctx.role, 'คำขอของฉัน')];
+    }
+
+    case 'pendingreq': {
+      // รายการรอจัดเป็นเรื่องของผู้ดูแล — พนักงานดูได้แค่ของตัวเอง
+      if (ctx.role !== 'owner') {
+        return [
+          F.text(
+            'รายการรอจัดของทั้งโรงดูได้ที่ผู้ดูแลระบบเท่านั้นครับ\n' +
+              'ดูสถานะคำขอของคุณได้ที่  คำขอของฉัน',
+            true,
+            ctx.role,
+          ),
+        ];
+      }
+      const rows = await repo.listRequests(db, 'pending', 30);
+      return [F.requestsCard(rows, liffUrl(env), ctx.role, 'รายการรอจัด')];
+    }
+
     case 'low': {
       const items = await repo.lowStockProducts(db);
       return [F.lowStockCard(items, liffUrl(env), ctx.role)];
@@ -170,7 +192,7 @@ async function handleText(ctx: Ctx, raw: string): Promise<LineMessage[]> {
       // พนักงานสั่งได้แค่เบิก — อย่าเพิ่งถามสินค้า ให้ตอบชัดเจนตั้งแต่ต้น
       if (ctx.role !== 'owner' && intent.action !== 'issue') {
         const label = F.ACTION_META[intent.action].label;
-        return [F.text(`🚫 คำสั่ง"${label}" ใช้ได้เฉพาะผู้ดูแลระบบครับ\n\nคุณสั่งของได้ด้วย  เบิก ปากกา 5\nถ้าต้องการเพิ่มหรือปรับยอด แจ้งผู้ดูแลได้เลยครับ`, true, ctx.role)];
+        return [F.text(`🚫 คำสั่ง "${label}" ใช้ได้เฉพาะผู้ดูแลระบบครับ\n\nคุณสั่งของได้ด้วย เบิก ปากกา 5\nถ้าต้องการเพิ่มหรือปรับยอด แจ้งผู้ดูแลได้เลยครับ`, true, ctx.role)];
       }
 
       const payload: DraftPayload = {
@@ -228,7 +250,7 @@ async function handlePostback(ctx: Ctx, data: URLSearchParams): Promise<LineMess
   if (a === 'start') {
     const action = (data.get('act') ?? 'issue') as ActionType;
     if (ctx.role !== 'owner' && action !== 'issue') {
-      return [F.text(`🚫 คำสั่ง"${F.ACTION_META[action].label}" ใช้ได้เฉพาะผู้ดูแลระบบครับ`, true, ctx.role)];
+      return [F.text(`🚫 คำสั่ง "${F.ACTION_META[action].label}" ใช้ได้เฉพาะผู้ดูแลระบบครับ`, true, ctx.role)];
     }
     const pid = Number(data.get('pid'));
     const draft: Draft = {
@@ -238,6 +260,14 @@ async function handlePostback(ctx: Ctx, data: URLSearchParams): Promise<LineMess
       payload: { action, query: '', productId: pid },
     };
     return advance(ctx, draft);
+  }
+
+  // ── คำขอเบิกของพนักงาน (ผู้ดูแลเท่านั้น) ──
+  if (a === 'req_fulfill' || a === 'req_cancel' || a === 'req_fulfill_all') {
+    if (ctx.role !== 'owner') {
+      return [F.text('🚫 จัดการรายการรอได้เฉพาะผู้ดูแลระบบครับ', true, ctx.role)];
+    }
+    return handleRequestPostback(ctx, a, Number(data.get('rid')));
   }
 
   const token = data.get('t') ?? '';
@@ -263,6 +293,83 @@ async function handlePostback(ctx: Ctx, data: URLSearchParams): Promise<LineMess
 }
 
 /* -------------------------------------------------------- flow engine */
+
+/**
+ * โหมดคำขอ: พนักงานสั่ง "เบิก" → เข้ารายการรอผู้ดูแล (ยังไม่ตัดสต๊อก)
+ * ผู้ดูแลที่สั่งเองยังตัดสต๊อกทันทีเหมือนเดิม
+ */
+function isRequestFlow(ctx: Ctx, action: ActionType): boolean {
+  return action === 'issue' && ctx.role !== 'owner';
+}
+
+async function handleRequestPostback(
+  ctx: Ctx,
+  action: 'req_fulfill' | 'req_cancel' | 'req_fulfill_all',
+  requestId: number,
+): Promise<LineMessage[]> {
+  const { db, env } = ctx;
+  const actor = { lineUserId: ctx.userId, name: ctx.userName, source: 'line' as const };
+
+  if (action === 'req_cancel') {
+    try {
+      const r = await repo.cancelRequest(db, requestId, actor);
+      return [F.text(`ยกเลิกคำขอ ${r.ref} แล้วครับ (${r.product_name})`, true, ctx.role)];
+    } catch (err) {
+      return [F.text(`❌ ${err instanceof AppError ? err.message : 'ยกเลิกไม่สำเร็จ'}`, true, ctx.role)];
+    }
+  }
+
+  if (action === 'req_fulfill_all') {
+    const { done, failed } = await repo.fulfillAllRequests(db, actor);
+    if (done.length === 0 && failed.length === 0) {
+      return [F.text('ไม่มีรายการรอจัดอยู่ครับ', true, ctx.role)];
+    }
+    const out: LineMessage[] = [
+      F.text(
+        `จัดให้แล้ว ${done.length} รายการ` + (failed.length ? ` · ยังจัดไม่ได้ ${failed.length} รายการ` : ''),
+        true,
+        ctx.role,
+      ),
+    ];
+    for (const f of failed.slice(0, 5)) {
+      out.push(
+        F.text(
+          `⚠️ ${f.request.product_name} — ${f.reason}\n   (ขอโดย ${f.request.user_name ?? '-'})`,
+          false,
+          ctx.role,
+        ),
+      );
+    }
+    const left = await repo.countPendingRequests(db);
+    if (left > 0) out.push(F.text(`ยังเหลือรายการรอจัดอีก ${left} รายการ`, true, ctx.role));
+    else out.push(F.text('เคลียร์รายการรอหมดแล้วครับ 🎉', true, ctx.role));
+    void env;
+    return out;
+  }
+
+  try {
+    const { request, movement } = await repo.fulfillRequest(db, requestId, actor);
+    return [
+      F.fulfillResultCard(
+        {
+          productName: request.product_name,
+          unit: request.product_unit,
+          qty: request.qty,
+          locationName: request.location_name,
+          afterQty: movement.balanceAfter,
+          totalQty: movement.total,
+          ref: request.ref,
+          who: request.user_name,
+        },
+        liffUrl(env),
+        ctx.role,
+      ),
+    ];
+  } catch (err) {
+    const message = err instanceof AppError ? err.message : 'จัดให้ไม่สำเร็จ';
+    return [F.text(`❌ ${message}`, true, ctx.role)];
+  }
+}
 
 async function productMessage(ctx: Ctx, productId: number): Promise<LineMessage> {
   const product = await repo.getProduct(ctx.db, productId);
@@ -318,11 +425,19 @@ async function advance(ctx: Ctx, draft: Draft): Promise<LineMessage[]> {
   const levels = await repo.getLevels(db, product.id);
 
   // 2) คลังต้นทาง/คลังที่ทำรายการ
+  const requestMode = isRequestFlow(ctx, p.action);
   if (!p.locationId) {
-    const candidates = p.action === 'issue' || p.action === 'transfer' ? levels.filter((l) => l.qty > 0) : levels;
+    const byAction = p.action === 'issue' || p.action === 'transfer';
+    let candidates = byAction ? levels.filter((l) => l.qty > 0) : levels;
+
+    // โหมดคำขอ: ขอได้แม้ของหมด — ถ้าไม่มีคลังไหนมีของเลย ให้เลือกได้ทุกคลัง (ยังไม่ตัดสต๊อกอยู่ดี)
+    if (requestMode && candidates.length === 0) candidates = levels;
     if (candidates.length === 0) {
       await repo.clearDraft(db, ctx.chatKey);
-      return [F.text(`"${product.name}" ไม่มีคงเหลือในคลังใดเลย จึงเบิกไม่ได้ครับ`, true, ctx.role)];
+      const msg = requestMode
+        ? 'ยังไม่มีคลังสินค้าในระบบ กรุณาให้ผู้ดูแลตั้งค่าคลังก่อนครับ'
+        : `"${product.name}" ไม่มีคงเหลือในคลังใดเลย จึงเบิกไม่ได้ครับ`;
+      return [F.text(msg, true, ctx.role)];
     }
     if (candidates.length === 1) {
       p.locationId = candidates[0].location_id;
@@ -374,6 +489,14 @@ async function advance(ctx: Ctx, draft: Draft): Promise<LineMessage[]> {
     : p.action === 'adjust' ? p.qty
     : current - p.qty;
 
+  // โหมดคำขอ: เตือนให้ทราบถ้าของในคลังไม่พอ แต่ยังให้ส่งคำขอได้
+  const shortNote =
+    requestMode && current < p.qty
+      ? current <= 0
+        ? `ตอนนี้ของหมดในคลังนี้ (คงเหลือ 0 จากที่ขอ ${fmtQty(p.qty)}) ผู้ดูแลจะจัดเพิ่มให้`
+        : `ของไม่พอครับ คงเหลือ ${fmtQty(current)} จากที่ขอ ${fmtQty(p.qty)}`
+      : null;
+
   return [
     F.confirmCard({
       action: p.action,
@@ -388,6 +511,8 @@ async function advance(ctx: Ctx, draft: Draft): Promise<LineMessage[]> {
       minQty: product.min_qty,
       note: p.note,
       token: draft.token,
+      requestMode,
+      shortNote,
     }, ctx.role),
   ];
 }
@@ -405,6 +530,51 @@ async function commit(ctx: Ctx, draft: Draft): Promise<LineMessage[]> {
   const actor = { lineUserId: ctx.userId, name: ctx.userName, source: 'line' as const };
   const locations = await repo.listLocations(db);
   const locName = (id?: number) => locations.find((l) => l.id === id)?.name ?? '-';
+
+  // ── โหมดคำขอ: พนักงานสั่งเบิก → บันทึกคำขอรอผู้ดูแลจัด (ยังไม่ตัดสต๊อก) ──
+  if (isRequestFlow(ctx, p.action)) {
+    try {
+      const current = await repo.getQty(db, product.id, p.locationId);
+      const shortNote =
+        current < p.qty
+          ? current <= 0
+            ? `ของหมดในคลังนี้ (คงเหลือ 0 จากที่ขอ ${fmtQty(p.qty)})`
+            : `ของไม่พอ คงเหลือ ${fmtQty(current)} จากที่ขอ ${fmtQty(p.qty)}`
+          : null;
+      const { ref } = await repo.createRequest(db, {
+        lineUserId: ctx.userId,
+        userName: ctx.userName,
+        productId: product.id,
+        locationId: p.locationId,
+        qty: p.qty,
+        note: p.note ?? null,
+        shortNote,
+      });
+      await repo.clearDraft(db, ctx.chatKey);
+      return [
+        F.requestDoneCard(
+          {
+            ref,
+            productName: product.name,
+            sku: product.sku,
+            unit: product.unit,
+            qty: p.qty,
+            locationName: locName(p.locationId),
+            currentQty: current,
+            note: p.note ?? null,
+            shortNote,
+          },
+          liffUrl(env),
+          ctx.role,
+        ),
+      ];
+    } catch (err) {
+      await repo.clearDraft(db, ctx.chatKey);
+      const message = err instanceof AppError ? err.message : 'ส่งคำขอไม่สำเร็จ กรุณาลองใหม่';
+      console.error('createRequest error', err);
+      return [F.text(`❌ ${message}`, true, ctx.role)];
+    }
+  }
 
   try {
     let result;

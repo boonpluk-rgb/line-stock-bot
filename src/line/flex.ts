@@ -1,6 +1,6 @@
 /* ตัวสร้าง Flex Message — เป็น "หน้าตา" ของระบบฝั่งแชท LINE */
 import type { ActionType, Role } from '../types';
-import type { LevelRow, MovementRow, ProductWithStock } from '../db/repo';
+import type { LevelRow, MovementRow, ProductWithStock, RequestRow } from '../db/repo';
 import { fmtQty, fmtThaiDateTime } from '../lib/util';
 
 type Flex = any;
@@ -109,8 +109,13 @@ export function quickReplyBar(role: Role = 'owner'): Flex {
     { label: '🕘 ประวัติ', text: 'ประวัติ' },
     { label: '❓ วิธีใช้', text: 'ช่วยเหลือ' },
   ];
-  const ownerOnly = [{ label: '📥 รับเข้า', text: 'รับเข้า ' }];
-  const items = role === 'owner' ? [...base, ...ownerOnly, ...tail] : [...base, ...tail];
+  const ownerOnly = [
+    { label: '📥 รับเข้า', text: 'รับเข้า ' },
+    { label: '📋 รายการรอจัด', text: 'รายการรอจัด' },
+  ];
+  const staffOnly = [{ label: '📋 คำขอของฉัน', text: 'คำขอของฉัน' }];
+  const items =
+    role === 'owner' ? [...base, ...ownerOnly, ...tail] : [...base, ...staffOnly, ...tail];
   return {
     items: items.map((i) => ({
       type: 'action',
@@ -165,7 +170,9 @@ export function helpMessage(liffUrl: string, role: Role = 'owner'): Flex {
   const staffCmds = [
     cmd('เช็คสต๊อก', 'เช็ค ปากกา', 'ดูยอดคงเหลือแยกตามคลัง (หรือพิมพ์/สแกนบาร์โค้ดมาตรง ๆ)'),
     gap(),
-    cmd('เบิกออก', 'เบิก ปากกา 5', 'ระบบจะให้เลือกสินค้า/คลัง แล้วยืนยันก่อนตัดสต๊อก'),
+    cmd('ขอเบิกของ', 'เบิก ปากกา 5', 'ระบบจะถามสินค้า/คลัง/จำนวน แล้วส่งคำขอให้ผู้ดูแล'),
+    gap(),
+    cmd('คำขอของฉัน', 'คำขอของฉัน', 'ดูว่าคำขอไหนยังรออยู่ หรือจัดให้ไปแล้วหรือยัง'),
     gap(),
     cmd('รายงาน', 'ใกล้หมด · ประวัติ · คลัง · สรุป', 'ดูของใกล้หมด ประวัติล่าสุด และรายชื่อคลัง'),
   ];
@@ -187,12 +194,20 @@ export function helpMessage(liffUrl: string, role: Role = 'owner'): Flex {
         {
           type: 'text',
           text: isOwner
-            ? 'เพิ่มหมายเหตุได้ด้วยเครื่องหมาย # เช่น  เบิก ปากกา 5 #งานอีเวนต์'
-            : 'ต้องการเพิ่มของ หรือพบว่ายอดไม่ตรง แจ้งผู้ดูแลระบบได้เลยครับ',
+            ? 'เพิ่มหมายเหตุได้ด้วยเครื่องหมาย # เช่น เบิก ปากกา 5 #งานอีเวนต์'
+            : '📌 คำขอของคุณจะยังไม่ตัดสต๊อกทันทีนะครับ ผู้ดูแลจะจัดส่งให้แล้วกด "จัดแล้ว" ค่อยตัด',
           size: 'xxs',
           color: C.muted,
           wrap: true,
           margin: 'lg',
+        },
+        {
+          type: 'text',
+          text: 'เพิ่มหมายเหตุได้ด้วยเครื่องหมาย # เช่น เบิก ปากกา 5 #งานอีเวนต์',
+          size: 'xxs',
+          color: C.muted,
+          wrap: true,
+          margin: 'sm',
         },
       ],
     },
@@ -454,24 +469,44 @@ export interface ConfirmView {
   minQty: number;
   note?: string | null;
   token: string;
+  /** true = โหมดคำขอ (พนักงานสั่งเบิก) — ยังไม่ตัดสต๊อก ปุ่มจะเป็น "ส่งคำขอ" */
+  requestMode?: boolean;
+  /** ของในคลังไม่พอ — แจ้งให้ทราบก่อนส่งคำขอ */
+  shortNote?: string | null;
 }
 
 export function confirmCard(v: ConfirmView, role: Role = 'owner'): Flex {
   const meta = ACTION_META[v.action];
+  const req = v.requestMode === true;
   const afterColor = stockColor(v.afterQty, v.minQty);
   const rows: Flex[] = [
     kv('คลัง', v.action === 'transfer' ? `${v.locationName} → ${v.toLocationName}` : v.locationName),
     kv(v.action === 'adjust' ? 'ปรับเป็น' : 'จำนวน', `${fmtQty(v.qty)} ${v.unit}`, meta.color, true),
     divider(),
     kv('คงเหลือปัจจุบัน', `${fmtQty(v.currentQty)} ${v.unit}`),
-    kv('คงเหลือหลังทำรายการ', `${fmtQty(v.afterQty)} ${v.unit}`, afterColor, true),
   ];
+  if (!req) rows.push(kv('คงเหลือหลังทำรายการ', `${fmtQty(v.afterQty)} ${v.unit}`, afterColor, true));
   if (v.note) rows.push(divider(), kv('หมายเหตุ', v.note));
+
+  const warnings: Flex[] = [];
+  if (v.shortNote) {
+    warnings.push({ type: 'text', text: `⚠️ ${v.shortNote}`, size: 'xxs', color: C.danger, margin: 'md', wrap: true });
+  } else if (!req) {
+    if (v.afterQty <= 0) {
+      warnings.push({ type: 'text', text: '⚠️ ทำรายการนี้แล้วสินค้าจะหมดคลัง', size: 'xxs', color: C.danger, margin: 'md', wrap: true });
+    } else if (v.minQty > 0 && v.afterQty <= v.minQty) {
+      warnings.push({ type: 'text', text: `⚠️ จะต่ำกว่าจุดสั่งซื้อ (ขั้นต่ำ ${fmtQty(v.minQty)})`, size: 'xxs', color: C.warn, margin: 'md', wrap: true });
+    }
+  }
 
   const bubble: Flex = {
     type: 'bubble',
     size: 'mega',
-    header: header('ตรวจสอบก่อนยืนยัน', `${meta.icon} ${meta.label}`, meta.color),
+    header: header(
+      req ? 'ตรวจสอบก่อนส่งคำขอ' : 'ตรวจสอบก่อนยืนยัน',
+      req ? '📋 คำขอเบิกของ' : `${meta.icon} ${meta.label}`,
+      req ? C.transfer : meta.color,
+    ),
     body: {
       type: 'box',
       layout: 'vertical',
@@ -488,11 +523,17 @@ export function confirmCard(v: ConfirmView, role: Role = 'owner'): Flex {
         },
         divider(),
         ...rows,
-        ...(v.afterQty <= 0
-          ? [{ type: 'text', text: '⚠️ ทำรายการนี้แล้วสินค้าจะหมดคลัง', size: 'xxs', color: C.danger, margin: 'md', wrap: true }]
-          : v.minQty > 0 && v.afterQty <= v.minQty
-            ? [{ type: 'text', text: `⚠️ จะต่ำกว่าจุดสั่งซื้อ (ขั้นต่ำ ${fmtQty(v.minQty)})`, size: 'xxs', color: C.warn, margin: 'md', wrap: true }]
-            : []),
+        ...warnings,
+        ...(req
+          ? [{
+              type: 'text',
+              text: 'ยังไม่ตัดสต๊อกนะครับ ผู้ดูแลจะจัดส่งให้แล้วจึงค่อยตัดยอด',
+              size: 'xxs',
+              color: C.muted,
+              margin: 'md',
+              wrap: true,
+            }]
+          : []),
       ],
     },
     footer: {
@@ -502,12 +543,16 @@ export function confirmCard(v: ConfirmView, role: Role = 'owner'): Flex {
       paddingAll: '12px',
       contents: [
         button('ยกเลิก', pb({ a: 'cancel', t: v.token }), 'secondary'),
-        button('ยืนยัน', pb({ a: 'confirm', t: v.token }), 'primary', meta.color),
+        button(req ? 'ส่งคำขอ' : 'ยืนยัน', pb({ a: 'confirm', t: v.token }), 'primary', req ? C.transfer : meta.color),
       ],
     },
     styles: { footer: { separator: true, separatorColor: C.line } },
   };
-  return wrap(`ยืนยัน${meta.label} ${v.productName} ${fmtQty(v.qty)} ${v.unit}`, bubble, role);
+  return wrap(
+    req ? `ส่งคำขอ ${v.productName} ${fmtQty(v.qty)} ${v.unit}` : `ยืนยัน${meta.label} ${v.productName} ${fmtQty(v.qty)} ${v.unit}`,
+    bubble,
+    role,
+  );
 }
 
 export interface ResultView extends Omit<ConfirmView, 'token' | 'currentQty'> {
@@ -569,6 +614,208 @@ export function resultCard(v: ResultView, liffUrl: string, role: Role = 'owner')
     styles: { footer: { separator: true, separatorColor: C.line } },
   };
   return wrap(`${meta.label} ${v.productName} ${fmtQty(v.qty)} ${v.unit} สำเร็จ`, bubble, role);
+}
+
+/* -------------------------------------------------------------- requests */
+
+const REQ_STATUS: Record<string, { label: string; color: string; icon: string }> = {
+  pending: { label: 'รอผู้ดูแลจัด', color: C.warn, icon: '🕐' },
+  fulfilling: { label: 'กำลังจัด', color: C.warn, icon: '⏳' },
+  fulfilled: { label: 'จัดให้แล้ว', color: C.ok, icon: '✅' },
+  cancelled: { label: 'ยกเลิกแล้ว', color: C.muted, icon: '🚫' },
+};
+
+function requestLine(r: RequestRow, role: Role): Flex {
+  const st = REQ_STATUS[r.status] ?? REQ_STATUS.pending;
+  return {
+    type: 'box',
+    layout: 'vertical',
+    spacing: 'xs',
+    contents: [
+      {
+        type: 'box',
+        layout: 'horizontal',
+        spacing: 'sm',
+        contents: [
+          { type: 'text', text: `${fmtQty(r.qty)} ${r.product_unit}`, size: 'sm', weight: 'bold', color: C.issue, flex: 3, wrap: true },
+          { type: 'text', text: `${st.icon} ${st.label}`, size: 'xxs', color: st.color, flex: 4, align: 'end', wrap: true },
+        ],
+      },
+      { type: 'text', text: r.product_name, size: 'sm', color: C.ink, wrap: true },
+      {
+        type: 'text',
+        text: `${r.location_name} · ${fmtThaiDateTime(r.created_at)}${r.user_name ? ` · ${r.user_name}` : ''}`,
+        size: 'xxs',
+        color: C.muted,
+        wrap: true,
+      },
+      ...(r.short_note
+        ? [{ type: 'text', text: `⚠️ ${r.short_note}`, size: 'xxs', color: C.danger, wrap: true }]
+        : []),
+      ...(r.note ? [{ type: 'text', text: `📝 ${r.note}`, size: 'xxs', color: C.body, wrap: true }] : []),
+      ...(role === 'owner' && r.status === 'pending'
+        ? [
+            {
+              type: 'box',
+              layout: 'horizontal',
+              spacing: 'sm',
+              margin: 'sm',
+              contents: [
+                button('จัดแล้ว', pb({ a: 'req_fulfill', rid: r.id }), 'primary', C.ok),
+                button('ยกเลิก', pb({ a: 'req_cancel', rid: r.id }), 'secondary'),
+              ],
+            },
+          ]
+        : []),
+    ],
+  };
+}
+
+/** การ์ดยืนยันว่าส่งคำขอเรียบร้อย (พนักงานเห็นใบนี้) */
+export function requestDoneCard(
+  v: { ref: string; productName: string; sku: string; unit: string; qty: number; locationName: string; currentQty: number; note?: string | null; shortNote?: string | null; pendingCount?: number },
+  liffUrl: string,
+  role: Role = 'staff',
+): Flex {
+  const bubble: Flex = {
+    type: 'bubble',
+    size: 'mega',
+    header: header('ส่งคำขอเรียบร้อยแล้ว', '📋 รอผู้ดูแลจัดส่ง', C.transfer),
+    body: {
+      type: 'box',
+      layout: 'vertical',
+      paddingAll: '16px',
+      spacing: 'md',
+      contents: [
+        {
+          type: 'box',
+          layout: 'vertical',
+          contents: [
+            { type: 'text', text: v.productName, size: 'md', weight: 'bold', color: C.ink, wrap: true },
+            { type: 'text', text: `${v.sku} · เลขที่ ${v.ref}`, size: 'xxs', color: C.muted, margin: 'xs', wrap: true },
+          ],
+        },
+        divider(),
+        kv('จำนวนที่ขอ', `${fmtQty(v.qty)} ${v.unit}`, C.issue, true),
+        kv('คลัง', v.locationName),
+        kv('คงเหลือในคลังตอนนี้', `${fmtQty(v.currentQty)} ${v.unit}`),
+        ...(v.note ? [divider(), kv('หมายเหตุ', v.note)] : []),
+        ...(v.shortNote
+          ? [{ type: 'text', text: `⚠️ ${v.shortNote}`, size: 'xxs', color: C.danger, margin: 'md', wrap: true }]
+          : []),
+        {
+          type: 'text',
+          text: '📌 สต๊อกยังไม่ถูกตัดนะครับ\nผู้ดูแลจะจัดส่งให้แล้วกด "จัดแล้ว" ค่อยตัดยอดออก',
+          size: 'xxs',
+          color: C.body,
+          margin: 'md',
+          wrap: true,
+        },
+      ],
+    },
+    footer: {
+      type: 'box',
+      layout: 'vertical',
+      spacing: 'sm',
+      paddingAll: '12px',
+      contents: [
+        uriButton('ดูคำขอของฉัน', `${liffUrl}`, 'primary'),
+      ],
+    },
+    styles: { footer: { separator: true, separatorColor: C.line } },
+  };
+  return wrap(`ส่งคำขอ ${v.productName} ${fmtQty(v.qty)} ${v.unit} เรียบร้อย`, bubble, role);
+}
+
+/** รายการคำขอ — ใช้ทั้ง "คำขอของฉัน" (พนักงาน) และ "รายการรอจัด" (ผู้ดูแล) */
+export function requestsCard(
+  rows: RequestRow[],
+  liffUrl: string,
+  role: Role = 'staff',
+  title = 'คำขอของฉัน',
+): Flex {
+  const pending = rows.filter((r) => r.status === 'pending').length;
+  const bubble: Flex = {
+    type: 'bubble',
+    size: 'mega',
+    header: header(
+      pending > 0 ? `มี ${pending} รายการที่ยังรออยู่` : 'ไม่มีรายการที่รออยู่',
+      title,
+      role === 'owner' ? C.brand : C.transfer,
+    ),
+    body: {
+      type: 'box',
+      layout: 'vertical',
+      paddingAll: '16px',
+      spacing: 'md',
+      contents:
+        rows.length === 0
+          ? [
+              {
+                type: 'text',
+                text: role === 'owner'
+                  ? 'ยังไม่มีคำขอจากพนักงานครับ\nพอพนักงานสั่งเบิก รายการจะมาที่นี่'
+                  : 'คุณยังไม่มีคำขอค้างอยู่ครับ\nพิมพ์ "เบิก ปากกา 5" เพื่อส่งคำขอได้เลย',
+                size: 'sm',
+                color: C.body,
+                wrap: true,
+              },
+            ]
+          : rows.slice(0, 12).flatMap((r, i) => [
+              ...(i > 0 ? [divider()] : []),
+              requestLine(r, role),
+            ]),
+    },
+    footer: {
+      type: 'box',
+      layout: 'vertical',
+      paddingAll: '12px',
+      contents: [
+        ...(role === 'owner' && pending > 0
+          ? [button(`จัดไปทั้งหมด (${pending})`, pb({ a: 'req_fulfill_all' }), 'primary', C.ok)]
+          : []),
+        uriButton('เปิดแดชบอร์ด', liffUrl, role === 'owner' && pending > 0 ? 'link' : 'primary'),
+      ],
+    },
+    styles: { footer: { separator: true, separatorColor: C.line } },
+  };
+  return wrap(`${title} ${rows.length} รายการ`, bubble, role);
+}
+
+/** ผู้ดูแลกด "จัดแล้ว" ในแชท */
+export function fulfillResultCard(
+  v: { productName: string; unit: string; qty: number; locationName: string; afterQty: number; totalQty: number; ref: string; who: string | null },
+  liffUrl: string,
+  role: Role = 'owner',
+): Flex {
+  const bubble: Flex = {
+    type: 'bubble',
+    size: 'mega',
+    header: header('จัดส่งเรียบร้อย', '✅ ตัดสต๊อกแล้ว', C.ok),
+    body: {
+      type: 'box',
+      layout: 'vertical',
+      paddingAll: '16px',
+      spacing: 'md',
+      contents: [
+        { type: 'text', text: v.productName, size: 'md', weight: 'bold', color: C.ink, wrap: true },
+        { type: 'text', text: `คำขอ ${v.ref}${v.who ? ` · ขอโดย ${v.who}` : ''}`, size: 'xxs', color: C.muted, margin: 'xs', wrap: true },
+        divider(),
+        kv('จัดให้', `${fmtQty(v.qty)} ${v.unit}`, C.issue, true),
+        kv('คลัง', v.locationName),
+        kv('คงเหลือในคลังนี้', `${fmtQty(v.afterQty)} ${v.unit}`, stockColor(v.afterQty, 0), true),
+        kv('รวมทุกคลัง', `${fmtQty(v.totalQty)} ${v.unit}`),
+      ],
+    },
+    footer: {
+      type: 'box',
+      layout: 'vertical',
+      paddingAll: '12px',
+      contents: [uriButton('ดูรายการรอจัดที่เหลือ', liffUrl, 'primary')],
+    },
+    styles: { footer: { separator: true, separatorColor: C.line } },
+  };
+  return wrap(`จัดให้ ${v.productName} ${fmtQty(v.qty)} ${v.unit} แล้ว`, bubble, role);
 }
 
 export function lowStockCard(items: ProductWithStock[], liffUrl: string, role: Role = 'owner'): Flex {

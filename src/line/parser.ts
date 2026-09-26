@@ -9,12 +9,24 @@ export type Intent =
   | { kind: 'history'; query?: string }
   | { kind: 'locations' }
   | { kind: 'summary' }
+  | { kind: 'myreq' }
+  | { kind: 'pendingreq' }
   | { kind: 'help' }
   | { kind: 'cancel' }
   | { kind: 'number'; value: number }
   | { kind: 'unknown'; text: string };
 
-type IntentName = ActionType | 'check' | 'low' | 'history' | 'locations' | 'summary' | 'help' | 'cancel';
+type IntentName =
+  | ActionType
+  | 'check'
+  | 'low'
+  | 'history'
+  | 'locations'
+  | 'summary'
+  | 'myreq'
+  | 'pendingreq'
+  | 'help'
+  | 'cancel';
 
 interface KeywordGroup {
   intent: IntentName;
@@ -40,6 +52,8 @@ const KEYWORDS: KeywordGroup[] = [
   { intent: 'history', words: ['history', 'log'], loose: ['ประวัติ', 'รายการล่าสุด', 'รายการ', 'ล่าสุด'] },
   { intent: 'locations', words: ['locations', 'warehouse'], loose: ['คลังสินค้า', 'คลัง', 'สาขา', 'ที่เก็บ'] },
   { intent: 'summary', words: ['dashboard', 'summary'], loose: ['สรุป', 'ภาพรวม', 'รายงาน'] },
+  { intent: 'myreq', words: [], loose: ['คำขอของฉัน', 'คำขอฉัน', 'คำขอของหนู', 'คำขอของผม', 'คำขอของเรา'] },
+  { intent: 'pendingreq', words: [], loose: ['รายการรอจัด', 'รอจัดส่ง', 'รอจัด', 'คำขอที่รอ', 'คำขอรอจัด', 'คำขอ'] },
   { intent: 'help', words: ['help', 'menu', 'start', '?'], loose: ['ช่วยเหลือ', 'วิธีใช้', 'เมนู', 'คำสั่ง'] },
   { intent: 'cancel', words: ['cancel'], loose: ['ยกเลิก', 'ยุติ', 'ไม่เอา'] },
 ];
@@ -90,6 +104,8 @@ export function parse(raw: string): Intent {
     case 'low': return { kind: 'low' };
     case 'locations': return rest ? { kind: 'check', query: rest } : { kind: 'locations' };
     case 'summary': return { kind: 'summary' };
+    case 'myreq': return { kind: 'myreq' };
+    case 'pendingreq': return { kind: 'pendingreq' };
     case 'history': return { kind: 'history', query: rest || undefined };
     case 'check': return { kind: 'check', query: rest };
     default: break;

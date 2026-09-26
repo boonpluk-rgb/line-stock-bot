@@ -241,6 +241,131 @@ async function refreshAll() {
   renderProducts(products);
   renderSettingsLocations(data.byLocation);
   renderHistoryChips();
+  renderRequests();
+}
+
+/* ------------------------------------------------- รายการรอจัด (คำขอ) */
+
+const REQ_STATUS = {
+  pending:    { label: 'รอจัด',     cls: 'badge--adjust' },
+  fulfilling: { label: 'กำลังจัด',  cls: 'badge--adjust' },
+  fulfilled:  { label: 'จัดแล้ว',   cls: 'badge--ok' },
+  cancelled:  { label: 'ยกเลิกแล้ว', cls: '' },
+};
+
+function requestCard(r, { canAct }) {
+  const st = REQ_STATUS[r.status] ?? REQ_STATUS.pending;
+  return `<div class="row" style="align-items:flex-start;gap:10px;padding:12px 0;border-bottom:1px solid var(--line-soft)">
+    <span class="row__label" style="flex:1;min-width:0">
+      <b style="color:var(--issue);font-size:14px">${fmt(r.qty)} ${esc(r.product_unit)}</b>
+      ${esc(r.product_name)}
+      <span style="display:block;font-size:11px;color:var(--muted);margin-top:2px">
+        ${esc(r.location_name)} · ${relTime(r.created_at)}${r.user_name ? ' · ' + esc(r.user_name) : ''}
+      </span>
+      ${r.short_note ? `<span style="display:block;font-size:11px;color:var(--danger);margin-top:2px">⚠️ ${esc(r.short_note)}</span>` : ''}
+      ${r.note ? `<span style="display:block;font-size:11px;color:var(--body);margin-top:2px">📝 ${esc(r.note)}</span>` : ''}
+    </span>
+    <span class="row__value" style="display:grid;gap:6px;justify-items:end;flex:0 0 auto">
+      <span class="badge ${st.cls}">${st.label}</span>
+      ${
+        canAct && r.status === 'pending'
+          ? `<span style="display:flex;gap:6px">
+               <button class="btn btn--receive" style="padding:6px 12px;font-size:12px" data-fulfill="${r.id}">จัดแล้ว</button>
+               <button class="btn btn--danger"    style="padding:6px 10px;font-size:12px" data-cancel="${r.id}">ยกเลิก</button>
+             </span>`
+          : ''
+      }
+    </span>
+  </div>`;
+}
+
+async function renderRequests() {
+  const owner = isOwner();
+  const mineBox = $('#myReqList');
+  const myCard = $('#myReqCard');
+  if (myCard) myCard.hidden = owner;
+
+  try {
+    if (owner) {
+      const rows = await api('/requests?status=pending&limit=200');
+      const badge = $('#reqCountBadge');
+      badge.textContent = `${rows.length} รายการ`;
+      badge.className = rows.length ? 'badge badge--adjust' : 'badge badge--ok';
+      $('#reqActions').hidden = rows.length === 0;
+      $('#fulfillAllBtn').dataset.n = String(rows.length);
+      $('#requestList').innerHTML = rows.length
+        ? rows.map((r) => requestCard(r, { canAct: true })).join('')
+        : '<div class="empty">ยังไม่มีคำขอค้างอยู่ 🎉</div>';
+    } else if (mineBox) {
+      const rows = await api('/requests/mine');
+      const pending = rows.filter((r) => r.status === 'pending').length;
+      const badge = $('#myReqBadge');
+      badge.textContent = pending ? `${pending} รอจัด` : 'ไม่มีค้าง';
+      badge.className = pending ? 'badge badge--adjust' : 'badge badge--ok';
+      mineBox.innerHTML = rows.length
+        ? rows.slice(0, 10).map((r) => requestCard(r, { canAct: false })).join('')
+        : '<div class="empty">คุณยังไม่มีคำขอในระบบ</div>';
+    }
+  } catch (err) {
+    if (owner) $('#requestList').innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+    else if (mineBox) mineBox.innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+  }
+}
+
+async function fulfillRequest(id, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const res = await api(`/requests/${id}/fulfill`, { method: 'POST', body: JSON.stringify({}) });
+    const p = res.movement?.balanceAfter;
+    toast(`จัดให้ ${res.request.product_name} แล้ว · คงเหลือ ${fmt(p)} ${res.request.product_unit}`, 'ok');
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    await refreshAll();
+  }
+}
+
+async function cancelRequest(id, btn) {
+  if (!confirm('ยกเลิกคำขอนี้?')) return;
+  if (btn) btn.disabled = true;
+  try {
+    await api(`/requests/${id}/cancel`, { method: 'POST', body: JSON.stringify({}) });
+    toast('ยกเลิกคำขอแล้ว', 'ok');
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    await refreshAll();
+  }
+}
+
+async function fulfillAll(btn) {
+  const n = Number(btn?.dataset?.n || 0);
+  if (n > 0 && !confirm(`จัดให้ทั้งหมด ${n} รายการ?\nรายการที่ของไม่พอจะถูกข้ามไว้`)) return;
+  if (btn) btn.disabled = true;
+  try {
+    const res = await api('/requests/fulfill-all', { method: 'POST', body: JSON.stringify({}) });
+    if (res.failedCount) {
+      toast(`จัดแล้ว ${res.doneCount} · จัดไม่ได้ ${res.failedCount} รายการ`, 'error');
+      if (res.failed?.length) {
+        openSheet(
+          `<div class="sheet__head"><h3>จัดไม่ได้ ${res.failedCount} รายการ</h3></div>` +
+            res.failed
+              .map(
+                (f) =>
+                  `<div class="row"><span class="row__label">${esc(f.product)}</span><span class="row__value" style="color:var(--danger)">${esc(f.reason)}</span></div>`,
+              )
+              .join('') +
+            `<button class="btn btn--ghost btn--block" style="margin-top:12px" data-close>ปิด</button>`,
+        );
+      }
+    } else {
+      toast(`จัดให้แล้วทั้งหมด ${res.doneCount} รายการ 🎉`, 'ok');
+    }
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    await refreshAll();
+  }
 }
 
 async function loadProducts() {
@@ -464,7 +589,7 @@ async function openProduct(id) {
       </div>
 
       <div class="btn-grid" style="margin-top:16px">
-        <button class="btn btn--issue" data-move="issue" data-id="${product.id}">📤 เบิกออก</button>
+        <button class="btn btn--issue" data-move="issue" data-id="${product.id}">${isOwner() ? '📤 เบิกออก' : '📋 ขอเบิกของ'}</button>
         <button class="btn btn--receive" data-move="receive" data-id="${product.id}" data-owner-only>📥 รับเข้า</button>
         <button class="btn btn--ghost" data-move="adjust" data-id="${product.id}" data-owner-only>⚖️ ปรับยอด</button>
         <button class="btn btn--ghost" data-move="transfer" data-id="${product.id}" data-owner-only>🔁 ย้ายคลัง</button>
@@ -500,15 +625,17 @@ async function openProduct(id) {
 /* ------------------------------------------------------- ทำรายการสต๊อก */
 
 async function openMovement(productId, action = 'issue') {
-  // พนักงานทำได้แค่เบิก
+  // พนักงานทำได้แค่ขอเบิก (ส่งคำขอให้ผู้ดูแลจัด) — ยังไม่ตัดสต๊อกทันที
   if (!isOwner() && action !== 'issue') action = 'issue';
+  const requestMode = action === 'issue' && !isOwner();
   const { product, levels } = await api(`/products/${productId}`);
   const meta = ACTIONS[action];
   const defaultLoc = levels.find((l) => l.qty > 0) ?? levels[0];
   const availableActions = isOwner() ? Object.entries(ACTIONS) : [['issue', ACTIONS.issue]];
 
   openSheet(`
-    ${sheetHead(meta.label, product.name)}
+    ${sheetHead(requestMode ? 'ขอเบิกของ' : meta.label, product.name)}
+    ${requestMode ? '<p class="hint" style="margin:8px 0 0">📌 ระบบจะส่งคำขอให้ผู้ดูแล ยังไม่ตัดสต๊อกจนกว่าเขาจะกด "จัดแล้ว"</p>' : ''}
     <div class="seg" style="margin-top:6px">
       ${availableActions
         .map(([key, a]) => `<button data-action="${key}" class="${key === action ? 'is-active' : ''}">${a.icon} ${a.label}</button>`)
@@ -548,7 +675,7 @@ async function openMovement(productId, action = 'issue') {
 
       <div class="confirm" id="preview"></div>
 
-      <button class="btn btn--${meta.cls} btn--block" style="margin-top:14px" type="submit" id="submitBtn">ยืนยัน</button>
+      <button class="btn btn--${requestMode ? 'primary' : meta.cls} btn--block" style="margin-top:14px" type="submit" id="submitBtn">ยืนยัน</button>
     </form>
   `);
 
@@ -562,18 +689,28 @@ async function openMovement(productId, action = 'issue') {
     const qty = Number(form.qty.value || 0);
     const after = action === 'receive' ? current + qty : action === 'adjust' ? qty : current - qty;
     const cls = stockClass(after, product.min_qty);
-    const invalid = (action !== 'adjust' && qty <= 0) || (action !== 'receive' && action !== 'adjust' && after < 0);
+    const notEnough = after < 0;
+    // โหมดคำขอ: ขอได้แม้ของไม่พอ (แค่ต้องมากกว่า 0) — ผู้ดูแลค่อยจัดให้ทีหลัง
+    const tooFew = action !== 'adjust' && qty <= 0;
+    const blocked = !requestMode && action !== 'receive' && action !== 'adjust' && notEnough;
+    const invalid = tooFew || blocked;
 
     $('#preview').innerHTML = `
       <div class="row"><span class="row__label">คงเหลือปัจจุบัน</span><span class="row__value">${fmt(current)} ${esc(unit)}</span></div>
-      <div class="row"><span class="row__label">${ACTIONS[action].verb}</span><span class="row__value" style="color:var(--${meta.cls})">${fmt(qty)} ${esc(unit)}</span></div>
-      <div class="row"><span class="row__label">คงเหลือหลังทำรายการ</span><span class="confirm__big qty-${cls}">${fmt(after)} ${esc(unit)}</span></div>
-      ${after < 0 ? '<div style="color:var(--danger);font-size:12px">สต๊อกไม่พอสำหรับจำนวนนี้</div>' : ''}
-      ${after >= 0 && product.min_qty > 0 && after <= product.min_qty ? `<div style="color:var(--warn);font-size:12px">⚠️ จะต่ำกว่าจุดสั่งซื้อ (ขั้นต่ำ ${fmt(product.min_qty)})</div>` : ''}`;
+      <div class="row"><span class="row__label">${requestMode ? 'ขอเบิก' : ACTIONS[action].verb}</span><span class="row__value" style="color:var(--${meta.cls})">${fmt(qty)} ${esc(unit)}</span></div>
+      ${
+        requestMode
+          ? notEnough
+            ? `<div style="color:var(--danger);font-size:12px">⚠️ คลังนี้เหลือ ${fmt(current)} ${esc(unit)} — ส่งคำขอได้อยู่ แต่ผู้ดูแลอาจต้องเติมของก่อน</div>`
+            : '<div style="color:var(--muted);font-size:12px">ยอดในคลังพอครับ</div>'
+          : `<div class="row"><span class="row__label">คงเหลือหลังทำรายการ</span><span class="confirm__big qty-${cls}">${fmt(after)} ${esc(unit)}</span></div>
+             ${notEnough ? '<div style="color:var(--danger);font-size:12px">สต๊อกไม่พอสำหรับจำนวนนี้</div>' : ''}
+             ${!notEnough && product.min_qty > 0 && after <= product.min_qty ? `<div style="color:var(--warn);font-size:12px">⚠️ จะต่ำกว่าจุดสั่งซื้อ (ขั้นต่ำ ${fmt(product.min_qty)})</div>` : ''}`
+      }`;
 
     const btn = $('#submitBtn');
-    btn.disabled = invalid;
-    btn.textContent = `ยืนยัน${ACTIONS[action].label} ${fmt(qty)} ${unit}`;
+    btn.disabled = invalid || blocked;
+    btn.textContent = requestMode ? `ส่งคำขอ ${fmt(qty)} ${unit}` : `ยืนยัน${ACTIONS[action].label} ${fmt(qty)} ${unit}`;
   };
 
   form.addEventListener('input', updatePreview);
@@ -604,7 +741,11 @@ async function openMovement(productId, action = 'issue') {
       if (action === 'transfer') payload.toLocationId = Number(form.toLocationId.value);
       const result = await api('/movements', { method: 'POST', body: JSON.stringify(payload) });
       closeSheet();
-      toast(`${meta.label}สำเร็จ · เลขที่ ${result.ref}`, 'ok');
+      if (result?.asRequest) {
+        toast(`ส่งคำขอแล้ว · เลขที่ ${result.ref}${result.shortNote ? ' · ' + result.shortNote : ''}`, 'ok');
+      } else {
+        toast(`${meta.label}สำเร็จ · เลขที่ ${result.ref}`, 'ok');
+      }
       await refreshAll();
     } catch (err) {
       toast(err.message, 'error');
@@ -1264,6 +1405,15 @@ document.addEventListener('click', (e) => {
     }
     return openMovement(Number(move.dataset.id), move.dataset.move);
   }
+
+  const fulfillBtn = e.target.closest('[data-fulfill]');
+  if (fulfillBtn) return fulfillRequest(Number(fulfillBtn.dataset.fulfill), fulfillBtn);
+
+  const cancelBtn = e.target.closest('[data-cancel]');
+  if (cancelBtn) return cancelRequest(Number(cancelBtn.dataset.cancel), cancelBtn);
+
+  const fulfillAllBtn = e.target.closest('#fulfillAllBtn');
+  if (fulfillAllBtn) return fulfillAll(fulfillAllBtn);
 
   const roleBtn = e.target.closest('[data-role]');
   if (roleBtn) {

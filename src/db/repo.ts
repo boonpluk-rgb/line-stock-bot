@@ -1438,6 +1438,225 @@ export async function listMovements(
   return results ?? [];
 }
 
+/* -------------------------------------------------------------- requests */
+
+export type RequestStatus = 'pending' | 'fulfilling' | 'fulfilled' | 'cancelled';
+
+export interface RequestRow {
+  id: number;
+  ref: string;
+  line_user_id: string | null;
+  user_name: string | null;
+  product_id: number;
+  product_name: string;
+  product_unit: string;
+  sku: string;
+  location_id: number;
+  location_name: string;
+  location_code: string;
+  qty: number;
+  note: string | null;
+  status: RequestStatus;
+  short_note: string | null;
+  created_at: string;
+  done_at: string | null;
+  done_by: string | null;
+  done_note: string | null;
+}
+
+const REQUEST_SELECT = `
+  SELECT r.id, r.ref, r.line_user_id, r.user_name, r.qty, r.note, r.status, r.short_note,
+         r.created_at, r.done_at, r.done_by, r.done_note,
+         p.id AS product_id, p.name AS product_name, p.unit AS product_unit, p.sku,
+         l.id AS location_id, l.name AS location_name, l.code AS location_code
+  FROM requests r
+  JOIN products p  ON p.id = r.product_id
+  JOIN locations l ON l.id = r.location_id`;
+
+/** พนักงานสั่งเบิก → บันทึกคำขอไว้รอผู้ดูแลจัด (ยังไม่ตัดสต๊อก) */
+export async function createRequest(
+  db: D1Database,
+  input: {
+    lineUserId: string | null;
+    userName: string | null;
+    productId: number;
+    locationId: number;
+    qty: number;
+    note?: string | null;
+    shortNote?: string | null;
+  },
+): Promise<{ id: number; ref: string }> {
+  if (input.qty <= 0) throw new AppError('จำนวนต้องมากกว่า 0');
+  const ref = makeRef('REQ');
+  const row = await db
+    .prepare(
+      `INSERT INTO requests (ref, line_user_id, user_name, product_id, location_id, qty, note, short_note)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+    )
+    .bind(
+      ref,
+      input.lineUserId,
+      input.userName,
+      input.productId,
+      input.locationId,
+      input.qty,
+      input.note ?? null,
+      input.shortNote ?? null,
+    )
+    .first<{ id: number }>();
+  return { id: row!.id, ref };
+}
+
+export async function getRequest(db: D1Database, id: number): Promise<RequestRow | null> {
+  return db.prepare(`${REQUEST_SELECT} WHERE r.id = ?`).bind(id).first<RequestRow>();
+}
+
+/**
+ * ดึงรายการคำขอ
+ * status = 'pending' → เฉพาะที่ยังรอจัด, 'all' → ทั้งหมด, หรือระบุตายตัว
+ */
+export async function listRequests(
+  db: D1Database,
+  status: 'pending' | 'all' | RequestStatus = 'pending',
+  limit = 100,
+): Promise<RequestRow[]> {
+  const { results } = status === 'all'
+    ? await db.prepare(`${REQUEST_SELECT} ORDER BY r.id DESC LIMIT ?`).bind(limit).all<RequestRow>()
+    : await db
+        .prepare(`${REQUEST_SELECT} WHERE r.status = ? ORDER BY r.id DESC LIMIT ?`)
+        .bind(status, limit)
+        .all<RequestRow>();
+  return results ?? [];
+}
+
+/** คำขอของผู้ใช้คนเดียว — ใช้ให้พนักงานดูสถานะของตัวเอง */
+export async function listRequestsByUser(
+  db: D1Database,
+  lineUserId: string,
+  limit = 30,
+): Promise<RequestRow[]> {
+  const { results } = await db
+    .prepare(`${REQUEST_SELECT} WHERE r.line_user_id = ? ORDER BY r.id DESC LIMIT ?`)
+    .bind(lineUserId, limit)
+    .all<RequestRow>();
+  return results ?? [];
+}
+
+export async function countPendingRequests(db: D1Database): Promise<number> {
+  const row = await db
+    .prepare(`SELECT COUNT(*) AS n FROM requests WHERE status = 'pending'`)
+    .first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
+/**
+ * ผู้ดูแลกด "จัดแล้ว" → ตัดสต๊อกจริง + ลง movements
+ *
+ * กันกดซ้ำด้วยการ "คว้าสิทธิ์" ก่อน: UPDATE เฉพาะแถวที่ยัง pending
+ * ถ้าไม่ได้แถวแปลว่ามีคนจัดไปแล้ว (หรือค้างจากครั้งก่อนเกิน 2 นาที — ปล่อยให้จัดใหม่ได้)
+ */
+export async function fulfillRequest(
+  db: D1Database,
+  id: number,
+  actor: Actor,
+  note?: string | null,
+): Promise<{ request: RequestRow; movement: MovementResult }> {
+  // ค้างค้างจากครั้งก่อน (เช่น Worker ถูกปิดกลางคัน) — ปล่อยให้จัดใหม่ได้
+  await db
+    .prepare(
+      `UPDATE requests SET status = 'pending'
+       WHERE id = ? AND status = 'fulfilling' AND updated_at < datetime('now', '-2 minutes')`,
+    )
+    .bind(id)
+    .run();
+
+  const claimed = await db
+    .prepare(
+      `UPDATE requests SET status = 'fulfilling', updated_at = datetime('now')
+       WHERE id = ? AND status = 'pending' RETURNING id`,
+    )
+    .bind(id)
+    .first<{ id: number }>();
+  if (!claimed) {
+    const cur = await getRequest(db, id);
+    if (!cur) throw new AppError('ไม่พบคำขอนี้', 404);
+    throw new AppError(
+      cur.status === 'fulfilled' ? 'คำขอนี้ถูกจัดไปแล้วครับ' : 'คำขอนี้ถูกยกเลิกแล้วครับ',
+    );
+  }
+
+  const request = await getRequest(db, id);
+  if (!request) {
+    await db.prepare(`UPDATE requests SET status = 'pending' WHERE id = ?`).bind(id).run();
+    throw new AppError('ไม่พบคำขอนี้', 404);
+  }
+
+  const movementNote = note || request.note
+    ? [note || request.note, `จากคำขอ ${request.ref}`].filter(Boolean).join(' · ')
+    : `จากคำขอ ${request.ref}`;
+
+  try {
+    const movement = await issue(
+      db, request.product_id, request.location_id, request.qty, movementNote, actor,
+    );
+    await db
+      .prepare(
+        `UPDATE requests SET status = 'fulfilled', done_at = datetime('now'), done_by = ?, done_note = ?
+         WHERE id = ?`,
+      )
+      .bind(actor.name, note ?? null, id)
+      .run();
+    return { request, movement };
+  } catch (err) {
+    // ตัดสต๊อกไม่ได้ (ของไม่พอ) — ปลดล็อกคำขอให้จัดใหม่ได้
+    await db
+      .prepare(`UPDATE requests SET status = 'pending', updated_at = datetime('now') WHERE id = ?`)
+      .bind(id)
+      .run();
+    throw err;
+  }
+}
+
+/** พนักงานกดยกเลิก / ผู้ดูแลกดยกเลิกแทน */
+export async function cancelRequest(db: D1Database, id: number, actor: Actor): Promise<RequestRow> {
+  const row = await db
+    .prepare(
+      `UPDATE requests SET status = 'cancelled', done_at = datetime('now'), done_by = ?
+       WHERE id = ? AND status = 'pending' RETURNING id`,
+    )
+    .bind(actor.name, id)
+    .first<{ id: number }>();
+  if (!row) {
+    const cur = await getRequest(db, id);
+    if (!cur) throw new AppError('ไม่พบคำขอนี้', 404);
+    throw new AppError('คำขอนี้ถูกจัดไปแล้ว ยกเลิกไม่ได้ครับ');
+  }
+  const updated = await getRequest(db, id);
+  return updated!;
+}
+
+/** จัดทีละรายการตามลำดับ — รายการที่พังจะถูกข้าม ไม่ทำให้ทั้งชุดล้ม */
+export async function fulfillAllRequests(
+  db: D1Database,
+  actor: Actor,
+): Promise<{ done: RequestRow[]; failed: { request: RequestRow; reason: string }[] }> {
+  const pending = await listRequests(db, 'pending', 200);
+  const done: RequestRow[] = [];
+  const failed: { request: RequestRow; reason: string }[] = [];
+  for (const request of pending) {
+    try {
+      const { request: updated } = await fulfillRequest(db, request.id, actor);
+      done.push(updated);
+    } catch (err) {
+      failed.push({
+        request,
+        reason: err instanceof AppError ? err.message : 'บันทึกไม่สำเร็จ',
+      });
+    }
+  }
+  return { done, failed };
+}
+
 /* --------------------------------------------------------------- reports */
 
 export async function lowStockProducts(db: D1Database, limit = 50): Promise<ProductWithStock[]> {
@@ -1465,6 +1684,7 @@ export interface Summary {
   todayIssue: number;
   todayReceive: number;
   todayMovements: number;
+  pendingRequests: number;
 }
 
 export async function getSummary(db: D1Database): Promise<Summary> {
@@ -1481,13 +1701,14 @@ export async function getSummary(db: D1Database): Promise<Summary> {
            AND COALESCE((SELECT SUM(qty) FROM stock_levels s WHERE s.product_id = p.id), 0) <= 0) AS outCount,
         (SELECT COALESCE(SUM(qty), 0) FROM movements WHERE type = 'issue' AND date(created_at, '+7 hours') = date('now', '+7 hours')) AS todayIssue,
         (SELECT COALESCE(SUM(qty), 0) FROM movements WHERE type = 'receive' AND date(created_at, '+7 hours') = date('now', '+7 hours')) AS todayReceive,
-        (SELECT COUNT(*) FROM movements WHERE date(created_at, '+7 hours') = date('now', '+7 hours')) AS todayMovements`,
+        (SELECT COUNT(*) FROM movements WHERE date(created_at, '+7 hours') = date('now', '+7 hours')) AS todayMovements,
+        (SELECT COUNT(*) FROM requests WHERE status = 'pending') AS pendingRequests`,
     )
     .first<Summary>();
   return (
     row ?? {
       productCount: 0, locationCount: 0, totalUnits: 0, lowCount: 0,
-      outCount: 0, todayIssue: 0, todayReceive: 0, todayMovements: 0,
+      outCount: 0, todayIssue: 0, todayReceive: 0, todayMovements: 0, pendingRequests: 0,
     }
   );
 }

@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import type { Env, Role } from '../types';
 import * as repo from '../db/repo';
-import { AppError } from '../lib/util';
+import { AppError, fmtQty } from '../lib/util';
 import { assertOwner, ownerOnly, requireAuth, type AuthUser } from './auth';
 
 type Vars = { Variables: { user: AuthUser }; Bindings: Env };
@@ -184,6 +184,52 @@ api.delete('/products/:id', ownerOnly, async (c) => {
   return c.json({ ok: true });
 });
 
+/* ------------------------------------------------------------- requests */
+
+/** พนักงานดูคำขอของตัวเองได้ (เจ้าของดูของตัวเองด้้วยวิธีเดียวกัน) */
+api.get('/requests/mine', async (c) => {
+  const me = c.get('user');
+  return c.json(await repo.listRequestsByUser(c.env.DB, me.lineUserId, 30));
+});
+
+/** รายการรอจัด — เฉพาะผู้ดูแล */
+api.get('/requests', ownerOnly, async (c) => {
+  const status = (c.req.query('status') ?? 'pending') as 'pending' | 'all' | 'fulfilled' | 'cancelled';
+  const limit = Math.min(Number(c.req.query('limit') ?? 100), 300);
+  return c.json(await repo.listRequests(c.env.DB, status, limit));
+});
+
+api.post('/requests/:id/fulfill', ownerOnly, async (c) => {
+  const user = c.get('user');
+  const body = await c.req.json<{ note?: string }>().catch(() => ({ note: undefined }));
+  const actor = { lineUserId: user.lineUserId, name: user.name, source: 'liff' as const };
+  const { request, movement } = await repo.fulfillRequest(
+    c.env.DB,
+    Number(c.req.param('id')),
+    actor,
+    body.note ?? null,
+  );
+  return c.json({ ok: true, request, movement });
+});
+
+api.post('/requests/:id/cancel', ownerOnly, async (c) => {
+  const user = c.get('user');
+  const actor = { lineUserId: user.lineUserId, name: user.name, source: 'liff' as const };
+  return c.json({ ok: true, request: await repo.cancelRequest(c.env.DB, Number(c.req.param('id')), actor) });
+});
+
+api.post('/requests/fulfill-all', ownerOnly, async (c) => {
+  const user = c.get('user');
+  const actor = { lineUserId: user.lineUserId, name: user.name, source: 'liff' as const };
+  const { done, failed } = await repo.fulfillAllRequests(c.env.DB, actor);
+  return c.json({
+    ok: failed.length === 0,
+    doneCount: done.length,
+    failedCount: failed.length,
+    failed: failed.map((f) => ({ id: f.request.id, product: f.request.product_name, reason: f.reason })),
+  });
+});
+
 /* ------------------------------------------------------------ movements */
 
 api.get('/movements', async (c) => {
@@ -210,6 +256,27 @@ api.post('/movements', async (c) => {
   const qty = Number(body.qty);
   if (!body.productId || !body.locationId) throw new AppError('ข้อมูลไม่ครบ');
   if (!Number.isFinite(qty)) throw new AppError('จำนวนไม่ถูกต้อง');
+
+  // พนักงานสั่งเบิกจากแดชบอร์ด → เข้ารายการรอผู้ดูแลเหมือนกับที่สั่งในแชท (ยังไม่ตัดสต๊อก)
+  if (body.action === 'issue' && user.role !== 'owner') {
+    const current = await repo.getQty(db, body.productId, body.locationId);
+    const shortNote =
+      current < qty
+        ? current <= 0
+          ? `ของหมดในคลังนี้ (คงเหลือ 0 จากที่ขอ ${fmtQty(qty)})`
+          : `ของไม่พอ คงเหลือ ${fmtQty(current)} จากที่ขอ ${fmtQty(qty)}`
+        : null;
+    const created = await repo.createRequest(db, {
+      lineUserId: user.lineUserId,
+      userName: user.name,
+      productId: body.productId,
+      locationId: body.locationId,
+      qty,
+      note: body.note ?? null,
+      shortNote,
+    });
+    return c.json({ ok: true, asRequest: true, ...created, shortNote, currentQty: current });
+  }
 
   let result;
   switch (body.action) {

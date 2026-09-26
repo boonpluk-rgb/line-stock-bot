@@ -1,8 +1,8 @@
 import { Hono } from 'hono';
-import type { Env } from '../types';
+import type { Env, Role } from '../types';
 import * as repo from '../db/repo';
 import { AppError } from '../lib/util';
-import { requireAuth, type AuthUser } from './auth';
+import { assertOwner, ownerOnly, requireAuth, type AuthUser } from './auth';
 
 type Vars = { Variables: { user: AuthUser }; Bindings: Env };
 
@@ -22,6 +22,20 @@ api.get('/config', (c) =>
 api.use('/*', requireAuth);
 
 api.get('/me', (c) => c.json(c.get('user')));
+
+/* ------------------------------------------------------- ผู้ใช้ / สิทธิ์ */
+
+api.get('/users', ownerOnly, async (c) => c.json(await repo.listUsers(c.env.DB)));
+
+api.put('/users/:id/role', ownerOnly, async (c) => {
+  const body = await c.req.json<{ role?: string }>();
+  const role = body.role as Role;
+  if (role !== 'owner' && role !== 'staff') throw new AppError('ระดับสิทธิ์ไม่ถูกต้อง');
+  const me = c.get('user');
+  const targetId = Number(c.req.param('id'));
+  await repo.setUserRole(c.env.DB, targetId, role, { lineUserId: me.lineUserId, role: me.role });
+  return c.json({ ok: true, id: targetId, role });
+});
 
 api.get('/summary', async (c) => {
   const db = c.env.DB;
@@ -50,13 +64,13 @@ api.get('/summary', async (c) => {
 
 api.get('/locations', async (c) => c.json(await repo.listLocations(c.env.DB, false)));
 
-api.post('/locations', async (c) => {
+api.post('/locations', ownerOnly, async (c) => {
   const body = await c.req.json<{ code: string; name: string; is_default?: boolean }>();
   if (!body.code?.trim() || !body.name?.trim()) throw new AppError('กรุณากรอกรหัสและชื่อคลัง');
   return c.json(await repo.createLocation(c.env.DB, body.code, body.name, !!body.is_default), 201);
 });
 
-api.put('/locations/:id', async (c) => {
+api.put('/locations/:id', ownerOnly, async (c) => {
   const body = await c.req.json<Record<string, unknown>>();
   const patch: Record<string, unknown> = { ...body };
   if ('is_default' in body) patch.is_default = body.is_default ? 1 : 0;
@@ -64,7 +78,7 @@ api.put('/locations/:id', async (c) => {
   return c.json(await repo.updateLocation(c.env.DB, Number(c.req.param('id')), patch as never));
 });
 
-api.delete('/locations/:id', async (c) => {
+api.delete('/locations/:id', ownerOnly, async (c) => {
   await repo.deleteLocation(c.env.DB, Number(c.req.param('id')));
   return c.json({ ok: true });
 });
@@ -99,7 +113,7 @@ api.get('/products/lookup/:code', async (c) => {
   return c.json({ product: lookup.product, levels, matchedBy: lookup.matchedBy });
 });
 
-api.post('/products/import/preview', async (c) => {
+api.post('/products/import/preview', ownerOnly, async (c) => {
   // ป้องกันไม่ให้ส่งข้อมูลใหญ่เกินจนทำให้ Worker หรือ D1 รับไม่ไหว
   const contentLength = Number(c.req.header('content-length') ?? 0);
   if (contentLength > 4 * 1024 * 1024) {
@@ -122,7 +136,7 @@ api.post('/products/import/preview', async (c) => {
   return c.json(plan);
 });
 
-api.post('/products/import', async (c) => {
+api.post('/products/import', ownerOnly, async (c) => {
   const body = await c.req.json<{ token?: unknown }>();
   if (typeof body.token !== 'string' || !body.token.trim()) {
     throw new AppError('ไม่พบรหัสยืนยันการนำเข้า กรุณาตรวจไฟล์ใหม่');
@@ -145,7 +159,7 @@ api.get('/products/:id', async (c) => {
   return c.json({ product, levels, movements, total: levels.reduce((s, l) => s + l.qty, 0) });
 });
 
-api.post('/products', async (c) => {
+api.post('/products', ownerOnly, async (c) => {
   const body = await c.req.json<Record<string, never>>();
   const product = await repo.createProduct(c.env.DB, body);
   // ตั้งยอดเริ่มต้นถ้าระบุมา
@@ -160,12 +174,12 @@ api.post('/products', async (c) => {
   return c.json(product, 201);
 });
 
-api.put('/products/:id', async (c) => {
+api.put('/products/:id', ownerOnly, async (c) => {
   const body = await c.req.json<Record<string, never>>();
   return c.json(await repo.updateProduct(c.env.DB, Number(c.req.param('id')), body));
 });
 
-api.delete('/products/:id', async (c) => {
+api.delete('/products/:id', ownerOnly, async (c) => {
   await repo.archiveProduct(c.env.DB, Number(c.req.param('id')));
   return c.json({ ok: true });
 });
@@ -189,6 +203,8 @@ api.post('/movements', async (c) => {
     note?: string;
   }>();
   const user = c.get('user');
+  // พนักงานสั่งได้แค่ "เบิก" ส่วนรับเข้า / ปรับยอด / ย้ายคลัง เป็นหน้าที่ผู้ดูแลเท่านั้น
+  if (body.action !== 'issue') assertOwner(user);
   const actor = { lineUserId: user.lineUserId, name: user.name, source: 'liff' as const };
   const db = c.env.DB;
   const qty = Number(body.qty);

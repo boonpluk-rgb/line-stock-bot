@@ -211,6 +211,9 @@ function applyDeepLink() {
 
 function paintUser() {
   const name = state.me?.name || 'ผู้ใช้';
+  const isOwner = state.me?.role === 'owner';
+  document.body.dataset.role = isOwner ? 'owner' : 'staff';
+
   $('#userInitial').textContent = name.trim().charAt(0).toUpperCase();
   if (state.me?.picture) {
     const img = $('#userAvatar');
@@ -220,6 +223,13 @@ function paintUser() {
   }
   $('#meName').textContent = name;
   $('#meId').textContent = state.me?.lineUserId ?? '-';
+
+  const badge = $('#meRoleBadge');
+  badge.textContent = isOwner ? 'ผู้ดูแล' : 'พนักงาน';
+  badge.className = `badge ${isOwner ? 'badge--transfer' : ''}`;
+  $('#meRoleHint').textContent = isOwner
+    ? 'คุณทำได้ทุกอย่าง: เพิ่ม/แก้/ลบสินค้า, นำเข้า Excel, ปรับยอด, ตั้งสิทธิ์พนักงาน'
+    : 'คุณดูสต๊อกและสั่งเบิกได้ การเพิ่มสินค้าหรือปรับยอดให้แจ้งผู้ดูแลระบบ';
 }
 
 async function refreshAll() {
@@ -230,6 +240,7 @@ async function refreshAll() {
   renderLocationFilter();
   renderProducts(products);
   renderSettingsLocations(data.byLocation);
+  renderHistoryChips();
 }
 
 async function loadProducts() {
@@ -329,6 +340,8 @@ function movementRow(m) {
 
 /* ------------------------------------------------------------- สินค้า */
 
+const isOwner = () => state.me?.role === 'owner';
+
 function renderLocationFilter() {
   const sel = $('#locationFilter');
   sel.innerHTML =
@@ -344,8 +357,10 @@ function renderProducts(products) {
 }
 
 function renderSettingsLocations(byLocation = []) {
+  const box = $('#locationList');
+  if (!box) return;
   const stats = Object.fromEntries(byLocation.map((l) => [l.id, l]));
-  $('#locationList').innerHTML = state.locations
+  box.innerHTML = state.locations
     .map((l) => {
       const s = stats[l.id] ?? { units: 0, items: 0 };
       return `<button class="item item--plain" data-location="${l.id}">
@@ -357,6 +372,42 @@ function renderSettingsLocations(byLocation = []) {
       </button>`;
     })
     .join('');
+}
+
+/* -------------------------------------------------- ผู้ใช้ / สิทธิ์ */
+
+function renderHistoryChips() {
+  // พนักงานไม่เห็นประเภทที่ตัวเองไม่ได้ทำ (รับเข้า/ปรับยอด/ย้ายคลัง)
+  $$('#historyChips .chip').forEach((c) => {
+    if (['receive', 'adjust', 'transfer'].includes(c.dataset.type)) c.hidden = !isOwner();
+  });
+}
+
+async function renderUsers() {
+  const box = $('#userList');
+  if (!box || !isOwner()) return;
+  try {
+    const users = await api('/users');
+    $('#userCountBadge').textContent = `${users.length} คน`;
+    box.innerHTML = users
+      .map((u) => {
+        const owner = u.role === 'owner';
+        const me = u.line_user_id === state.me?.lineUserId;
+        return `<div class="row">
+          <span class="row__label">
+            ${esc(u.display_name || 'ไม่ทราบชื่อ')}${me ? ' (ฉัน)' : ''}
+            <span style="display:block;font-size:11px;color:var(--muted)">เข้าล่าสุด ${relTime(u.last_seen_at)}</span>
+          </span>
+          <span class="row__value">
+            <span class="badge ${owner ? 'badge--transfer' : ''}">${owner ? 'ผู้ดูแล' : 'พนักงาน'}</span>
+            ${me ? '' : `<button class="link" data-role="${u.id}" data-next="${owner ? 'staff' : 'owner'}" style="margin-left:8px">${owner ? 'ถอดสิทธิ์' : 'ให้สิทธิ์'}</button>`}
+          </span>
+        </div>`;
+      })
+      .join('');
+  } catch (err) {
+    box.innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+  }
 }
 
 /* ------------------------------------------------------------ ประวัติ */
@@ -414,9 +465,9 @@ async function openProduct(id) {
 
       <div class="btn-grid" style="margin-top:16px">
         <button class="btn btn--issue" data-move="issue" data-id="${product.id}">📤 เบิกออก</button>
-        <button class="btn btn--receive" data-move="receive" data-id="${product.id}">📥 รับเข้า</button>
-        <button class="btn btn--ghost" data-move="adjust" data-id="${product.id}">⚖️ ปรับยอด</button>
-        <button class="btn btn--ghost" data-move="transfer" data-id="${product.id}">🔁 ย้ายคลัง</button>
+        <button class="btn btn--receive" data-move="receive" data-id="${product.id}" data-owner-only>📥 รับเข้า</button>
+        <button class="btn btn--ghost" data-move="adjust" data-id="${product.id}" data-owner-only>⚖️ ปรับยอด</button>
+        <button class="btn btn--ghost" data-move="transfer" data-id="${product.id}" data-owner-only>🔁 ย้ายคลัง</button>
       </div>
 
       <section>
@@ -436,7 +487,7 @@ async function openProduct(id) {
         <div class="timeline">${movements.length ? movements.slice(0, 12).map(movementRow).join('') : '<div class="empty">ยังไม่มีรายการ</div>'}</div>
       </section>
 
-      <section>
+      <section data-owner-only>
         <button class="btn btn--ghost btn--block" data-edit-product="${product.id}">แก้ไขข้อมูลสินค้า</button>
       </section>
     `);
@@ -449,14 +500,17 @@ async function openProduct(id) {
 /* ------------------------------------------------------- ทำรายการสต๊อก */
 
 async function openMovement(productId, action = 'issue') {
+  // พนักงานทำได้แค่เบิก
+  if (!isOwner() && action !== 'issue') action = 'issue';
   const { product, levels } = await api(`/products/${productId}`);
   const meta = ACTIONS[action];
   const defaultLoc = levels.find((l) => l.qty > 0) ?? levels[0];
+  const availableActions = isOwner() ? Object.entries(ACTIONS) : [['issue', ACTIONS.issue]];
 
   openSheet(`
     ${sheetHead(meta.label, product.name)}
     <div class="seg" style="margin-top:6px">
-      ${Object.entries(ACTIONS)
+      ${availableActions
         .map(([key, a]) => `<button data-action="${key}" class="${key === action ? 'is-active' : ''}">${a.icon} ${a.label}</button>`)
         .join('')}
     </div>
@@ -1178,6 +1232,7 @@ function switchTab(tab) {
   }[tab];
   window.scrollTo({ top: 0, behavior: 'smooth' });
   if (tab === 'history') renderHistory();
+  if (tab === 'settings' && isOwner()) renderUsers();
 }
 
 /* ---------------------------------------------------------- listeners */
@@ -1203,7 +1258,31 @@ document.addEventListener('click', (e) => {
   if (product) return openProduct(Number(product.dataset.product));
 
   const move = e.target.closest('[data-move]');
-  if (move) return openMovement(Number(move.dataset.id), move.dataset.move);
+  if (move) {
+    if (!isOwner() && move.dataset.move !== 'issue') {
+      return toast('คำสั่งนี้ใช้ได้เฉพาะผู้ดูแลระบบครับ', 'error');
+    }
+    return openMovement(Number(move.dataset.id), move.dataset.move);
+  }
+
+  const roleBtn = e.target.closest('[data-role]');
+  if (roleBtn) {
+    const next = roleBtn.dataset.next;
+    if (!confirm(next === 'owner' ? 'ให้สิทธิ์ผู้ดูแลแก่คนนี้?' : 'ถอดสิทธิ์ผู้ดูแลจากคนนี้?')) return;
+    roleBtn.disabled = true;
+    return api(`/users/${roleBtn.dataset.role}/role`, {
+      method: 'PUT',
+      body: JSON.stringify({ role: next }),
+    })
+      .then(() => {
+        toast(next === 'owner' ? 'ให้สิทธิ์ผู้ดูแลแล้ว' : 'ถอดสิทธิ์แล้ว');
+        renderUsers();
+      })
+      .catch((err) => {
+        toast(err.message, 'error');
+        roleBtn.disabled = false;
+      });
+  }
 
   const edit = e.target.closest('[data-edit-product]');
   if (edit) {

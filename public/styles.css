@@ -67,6 +67,8 @@
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 /* ต้องมาก่อนทุก .class ที่กำหนด display เอง ไม่งั้น attribute hidden จะถูก override */
 [hidden] { display: none !important; }
+/* ส่วนที่ใช้ได้เฉพาะผู้ดูแล — ซ่อนให้พนักงานโดยอัตโนมัติ */
+body:not([data-role="owner"]) [data-owner-only] { display: none !important; }
 html, body { margin: 0; padding: 0; }
 body {
   background: var(--bg);
@@ -190,6 +192,8 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .badge--transfer { background: var(--transfer-bg); color: var(--transfer); }
 
 .qty-ok { color: var(--ok); } .qty-low { color: var(--warn); } .qty-out { color: var(--danger); }
+
+.hint { font-size: 12.5px; color: var(--muted); line-height: 1.6; }
 
 /* --------------------------------------------------- timeline */
 .timeline { display: grid; }

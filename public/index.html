@@ -80,7 +80,7 @@
       </div>
 
       <div id="productList" class="list list--cards"></div>
-      <div class="btn-stack">
+      <div class="btn-stack" data-owner-only>
         <button class="btn btn--ghost btn--block" id="importProductBtn" type="button">📥 นำเข้าสินค้าจาก Excel / CSV</button>
         <button class="btn btn--ghost btn--block" id="addProductBtn" type="button">+ เพิ่มสินค้าใหม่</button>
       </div>
@@ -102,6 +102,29 @@
     <section class="view" data-view="settings" hidden>
       <div class="card">
         <div class="card__head">
+          <h2>บัญชีของฉัน</h2>
+          <span class="badge" id="meRoleBadge">-</span>
+        </div>
+        <div class="list">
+          <div class="row"><span class="row__label">ชื่อ</span><span class="row__value" id="meName">-</span></div>
+          <div class="row"><span class="row__label">LINE User ID</span><span class="row__value mono" id="meId">-</span></div>
+        </div>
+        <p class="hint" id="meRoleHint" style="margin-top:12px"></p>
+      </div>
+
+      <div class="card" data-owner-only>
+        <div class="card__head">
+          <h2>ผู้ใช้งานทั้งหมด</h2>
+          <span class="badge" id="userCountBadge">0</span>
+        </div>
+        <p style="margin:0 0 12px;color:var(--body);font-size:13px;line-height:1.6">
+          คนที่มีป้าย <b>ผู้ดูแล</b> ทำได้ทุกอย่าง · คนที่เป็น <b>พนักงาน</b> ดูสต๊อกและสั่งเบิกได้อย่างเดียว
+        </p>
+        <div id="userList" class="list"><div class="skeleton"></div></div>
+      </div>
+
+      <div class="card" data-owner-only>
+        <div class="card__head">
           <h2>คลังสินค้า</h2>
           <button class="link" id="addLocationBtn">+ เพิ่มคลัง</button>
         </div>
@@ -114,14 +137,14 @@
           <p>พิมพ์คุยกับบอทได้เลย ระบบจะให้ยืนยันก่อนทุกครั้ง</p>
           <code>เช็ค ปากกา</code>
           <code>เบิก ปากกา 5</code>
-          <code>รับเข้า กระดาษ A4 10 @คลังกลาง</code>
-          <code>ย้าย ปากกา 5 @คลังกลาง @หน้าร้าน</code>
-          <code>ปรับ ปากกา 42 #นับสต๊อกประจำเดือน</code>
+          <code data-owner-only>รับเข้า กระดาษ A4 10 @คลังกลาง</code>
+          <code data-owner-only>ย้าย ปากกา 5 @คลังกลาง @หน้าร้าน</code>
+          <code data-owner-only>ปรับ ปากกา 42 #นับสต๊อกประจำเดือน</code>
           <code>ใกล้หมด · ประวัติ · คลัง · สรุป</code>
         </div>
       </div>
 
-      <div class="card">
+      <div class="card" data-owner-only>
         <div class="card__head"><h2>QR Code สินค้า</h2></div>
         <p style="margin:0 0 12px;color:var(--body);font-size:13px;line-height:1.6">
           สร้าง QR ใหม่จากรหัสสินค้า (SKU) เพื่อใช้สแกนเปิดสินค้าได้ทันที
@@ -129,13 +152,6 @@
         <button class="btn btn--ghost btn--block" id="qrPrintBtn" type="button">พิมพ์ QR สินค้าทั้งหมด</button>
       </div>
 
-      <div class="card">
-        <div class="card__head"><h2>บัญชีผู้ใช้</h2></div>
-        <div class="list">
-          <div class="row"><span class="row__label">ชื่อ</span><span class="row__value" id="meName">-</span></div>
-          <div class="row"><span class="row__label">LINE User ID</span><span class="row__value mono" id="meId">-</span></div>
-        </div>
-      </div>
       <div class="footnote">LINE Stock · ทำงานบน Cloudflare Workers + D1</div>
     </section>
   </main>

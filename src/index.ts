@@ -46,7 +46,7 @@ app.post('/line/webhook', async (c) => {
 /* จำลองบทสนทนาไว้ทดสอบตอนพัฒนา — ปิดสนิทบน production */
 app.post('/line/simulate', async (c) => {
   if (c.env.ENVIRONMENT !== 'dev') return c.json({ error: 'ไม่พบเส้นทางนี้' }, 404);
-  const body = await c.req.json<{ user?: string; text?: string; postback?: string }>();
+  const body = await c.req.json<{ user?: string; text?: string; postback?: string; as?: string }>();
   const messages = await simulate(c.env, body.user ?? 'Utest0000000000000000000000000001', body);
   return c.json({ messages });
 });

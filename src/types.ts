@@ -18,6 +18,18 @@ export interface Env {
 export type MovementType = 'issue' | 'receive' | 'adjust' | 'transfer_out' | 'transfer_in';
 export type ActionType = 'issue' | 'receive' | 'adjust' | 'transfer';
 
+/** ระดับสิทธิ์ผู้ใช้ — owner ทำได้ทุกอย่าง, staff ทำได้แค่ดูและสั่งเบิก */
+export type Role = 'owner' | 'staff';
+
+export interface UserRow {
+  id: number;
+  line_user_id: string;
+  display_name: string | null;
+  role: Role;
+  created_at: string;
+  last_seen_at: string;
+}
+
 export interface Product {
   id: number;
   sku: string;

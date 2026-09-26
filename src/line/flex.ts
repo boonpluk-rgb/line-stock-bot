@@ -1,5 +1,5 @@
 /* ตัวสร้าง Flex Message — เป็น "หน้าตา" ของระบบฝั่งแชท LINE */
-import type { ActionType } from '../types';
+import type { ActionType, Role } from '../types';
 import type { LevelRow, MovementRow, ProductWithStock } from '../db/repo';
 import { fmtQty, fmtThaiDateTime } from '../lib/util';
 
@@ -92,21 +92,25 @@ function uriButton(label: string, uri: string, style: 'primary' | 'secondary' | 
   return { type: 'button', style, height: 'sm', action: { type: 'uri', label, uri } };
 }
 
-export function text(msg: string, quickReplies = true): Flex {
+export function text(msg: string, quickReplies = true, role: Role = 'owner'): Flex {
   const m: Flex = { type: 'text', text: msg };
-  if (quickReplies) m.quickReply = quickReplyBar();
+  if (quickReplies) m.quickReply = quickReplyBar(role);
   return m;
 }
 
-export function quickReplyBar(): Flex {
-  const items = [
+/** ปุ่มลัดด่วน — พนักงานไม่เห็นคำสั่งของผู้ดูแล (กดแล้วจะถูกบล็อกอยู่ดี) */
+export function quickReplyBar(role: Role = 'owner'): Flex {
+  const base = [
     { label: '📦 เช็คสต๊อก', text: 'เช็ค ' },
     { label: '📤 เบิกของ', text: 'เบิก ' },
-    { label: '📥 รับเข้า', text: 'รับเข้า ' },
+  ];
+  const tail = [
     { label: '⚠️ ใกล้หมด', text: 'ใกล้หมด' },
     { label: '🕘 ประวัติ', text: 'ประวัติ' },
     { label: '❓ วิธีใช้', text: 'ช่วยเหลือ' },
   ];
+  const ownerOnly = [{ label: '📥 รับเข้า', text: 'รับเข้า ' }];
+  const items = role === 'owner' ? [...base, ...ownerOnly, ...tail] : [...base, ...tail];
   return {
     items: items.map((i) => ({
       type: 'action',
@@ -115,9 +119,9 @@ export function quickReplyBar(): Flex {
   };
 }
 
-function wrap(altText: string, bubble: Flex, withQuickReply = true): Flex {
+function wrap(altText: string, bubble: Flex, role: Role = 'owner'): Flex {
   const msg: Flex = { type: 'flex', altText, contents: bubble };
-  if (withQuickReply) msg.quickReply = quickReplyBar();
+  msg.quickReply = quickReplyBar(role);
   return msg;
 }
 
@@ -129,7 +133,7 @@ function stockColor(qty: number, minQty: number): string {
 
 /* -------------------------------------------------------------- bubbles */
 
-export function helpMessage(liffUrl: string): Flex {
+export function helpMessage(liffUrl: string, role: Role = 'owner'): Flex {
   const cmd = (title: string, example: string, desc: string) => ({
     type: 'box',
     layout: 'vertical',
@@ -141,30 +145,50 @@ export function helpMessage(liffUrl: string): Flex {
       { type: 'text', text: desc, size: 'xxs', color: C.muted, wrap: true },
     ],
   });
+  const gap = () => ({ type: 'separator', color: C.line });
+  const isOwner = role === 'owner';
+
+  const ownerCmds = [
+    cmd('เช็คสต๊อก', 'เช็ค ปากกา', 'ดูยอดคงเหลือแยกตามคลัง (หรือพิมพ์/สแกนบาร์โค้ดมาตรง ๆ)'),
+    gap(),
+    cmd('เบิกออก', 'เบิก ปากกา 5', 'ระบบจะให้เลือกสินค้า/คลัง แล้วยืนยันก่อนตัดสต๊อก'),
+    gap(),
+    cmd('รับเข้า', 'รับเข้า กระดาษ A4 10 @คลังกลาง', 'ใส่ @ชื่อคลัง เพื่อระบุคลังทันที'),
+    gap(),
+    cmd('ปรับยอด', 'ปรับ ปากกา 42', 'ปรับให้ตรงกับจำนวนที่นับได้จริง'),
+    gap(),
+    cmd('ย้ายคลัง', 'ย้าย ปากกา 5 @คลังกลาง @หน้าร้าน', 'ตัดจากคลังแรก ไปเพิ่มที่คลังหลัง'),
+    gap(),
+    cmd('รายงาน', 'ใกล้หมด · ประวัติ · คลัง', 'ดูของใกล้หมด ประวัติล่าสุด และรายชื่อคลัง'),
+  ];
+
+  const staffCmds = [
+    cmd('เช็คสต๊อก', 'เช็ค ปากกา', 'ดูยอดคงเหลือแยกตามคลัง (หรือพิมพ์/สแกนบาร์โค้ดมาตรง ๆ)'),
+    gap(),
+    cmd('เบิกออก', 'เบิก ปากกา 5', 'ระบบจะให้เลือกสินค้า/คลัง แล้วยืนยันก่อนตัดสต๊อก'),
+    gap(),
+    cmd('รายงาน', 'ใกล้หมด · ประวัติ · คลัง · สรุป', 'ดูของใกล้หมด ประวัติล่าสุด และรายชื่อคลัง'),
+  ];
 
   const bubble: Flex = {
     type: 'bubble',
     size: 'mega',
-    header: header('พิมพ์คำสั่งสั้น ๆ ได้เลย', 'วิธีใช้งาน', C.brand),
+    header: header(
+      isOwner ? 'พิมพ์คำสั่งสั้น ๆ ได้เลย' : 'คำสั่งสำหรับพนักงาน',
+      isOwner ? 'วิธีใช้งาน · ผู้ดูแล' : 'วิธีใช้งาน · พนักงาน',
+      isOwner ? C.brand : C.transfer,
+    ),
     body: {
       type: 'box',
       layout: 'vertical',
       paddingAll: '16px',
       contents: [
-        cmd('เช็คสต๊อก', 'เช็ค ปากกา', 'ดูยอดคงเหลือแยกตามคลัง (หรือพิมพ์/สแกนบาร์โค้ดมาตรง ๆ)'),
-        divider(),
-        cmd('เบิกออก', 'เบิก ปากกา 5', 'ระบบจะให้เลือกสินค้า/คลัง แล้วยืนยันก่อนตัดสต๊อก'),
-        divider(),
-        cmd('รับเข้า', 'รับเข้า กระดาษ A4 10 @คลังกลาง', 'ใส่ @ชื่อคลัง เพื่อระบุคลังทันที'),
-        divider(),
-        cmd('ปรับยอด', 'ปรับ ปากกา 42', 'ปรับให้ตรงกับจำนวนที่นับได้จริง'),
-        divider(),
-        cmd('ย้ายคลัง', 'ย้าย ปากกา 5 @คลังกลาง @หน้าร้าน', 'ตัดจากคลังแรก ไปเพิ่มที่คลังหลัง'),
-        divider(),
-        cmd('รายงาน', 'ใกล้หมด · ประวัติ · คลัง', 'ดูของใกล้หมด ประวัติล่าสุด และรายชื่อคลัง'),
+        ...(isOwner ? ownerCmds : staffCmds),
         {
           type: 'text',
-          text: 'เพิ่มหมายเหตุได้ด้วยเครื่องหมาย # เช่น  เบิก ปากกา 5 #งานอีเวนต์',
+          text: isOwner
+            ? 'เพิ่มหมายเหตุได้ด้วยเครื่องหมาย # เช่น  เบิก ปากกา 5 #งานอีเวนต์'
+            : 'ต้องการเพิ่มของ หรือพบว่ายอดไม่ตรง แจ้งผู้ดูแลระบบได้เลยครับ',
           size: 'xxs',
           color: C.muted,
           wrap: true,
@@ -180,13 +204,14 @@ export function helpMessage(liffUrl: string): Flex {
     },
     styles: { footer: { separator: true, separatorColor: C.line } },
   };
-  return wrap('วิธีใช้งานระบบสต๊อก', bubble);
+  return wrap('วิธีใช้งานระบบสต๊อก', bubble, role);
 }
 
 export function productCard(
   product: ProductWithStock | (ProductWithStock & { total_qty: number }),
   levels: LevelRow[],
   liffUrl: string,
+  role: Role = 'owner',
 ): Flex {
   const total = product.total_qty ?? 0;
   const color = stockColor(total, product.min_qty);
@@ -270,17 +295,20 @@ export function productCard(
           type: 'box',
           layout: 'horizontal',
           spacing: 'sm',
-          contents: [
-            button('เบิกออก', pb({ a: 'start', act: 'issue', pid: product.id }), 'primary', C.issue),
-            button('รับเข้า', pb({ a: 'start', act: 'receive', pid: product.id }), 'primary', C.receive),
-          ],
+          contents:
+            role === 'owner'
+              ? [
+                  button('เบิกออก', pb({ a: 'start', act: 'issue', pid: product.id }), 'primary', C.issue),
+                  button('รับเข้า', pb({ a: 'start', act: 'receive', pid: product.id }), 'primary', C.receive),
+                ]
+              : [button('📤 เบิกออก', pb({ a: 'start', act: 'issue', pid: product.id }), 'primary', C.issue)],
         },
         uriButton('ดูรายละเอียดในแดชบอร์ด', `${liffUrl}?p=${product.id}`),
       ],
     },
     styles: { footer: { separator: true, separatorColor: C.line } },
   };
-  return wrap(`${product.name} คงเหลือ ${fmtQty(total)} ${product.unit}`, bubble);
+  return wrap(`${product.name} คงเหลือ ${fmtQty(total)} ${product.unit}`, bubble, role);
 }
 
 export function productPicker(
@@ -288,6 +316,7 @@ export function productPicker(
   action: ActionType | 'view',
   token: string,
   hint?: string,
+  role: Role = 'owner',
 ): Flex {
   const meta = action === 'view' ? VIEW_META : ACTION_META[action];
   const rows = items.slice(0, 8).map((p) => ({
@@ -343,7 +372,7 @@ export function productPicker(
       contents: [button('ยกเลิก', pb({ a: 'cancel', t: token }), 'secondary')],
     },
   };
-  return wrap('เลือกสินค้า', bubble);
+  return wrap('เลือกสินค้า', bubble, role);
 }
 
 export function locationPicker(
@@ -353,6 +382,7 @@ export function locationPicker(
   action: ActionType,
   token: string,
   target: 'from' | 'to' = 'from',
+  role: Role = 'owner',
 ): Flex {
   const meta = ACTION_META[action];
   const title =
@@ -408,7 +438,7 @@ export function locationPicker(
       contents: [button('ยกเลิก', pb({ a: 'cancel', t: token }), 'secondary')],
     },
   };
-  return wrap(title, bubble);
+  return wrap(title, bubble, role);
 }
 
 export interface ConfirmView {
@@ -426,7 +456,7 @@ export interface ConfirmView {
   token: string;
 }
 
-export function confirmCard(v: ConfirmView): Flex {
+export function confirmCard(v: ConfirmView, role: Role = 'owner'): Flex {
   const meta = ACTION_META[v.action];
   const afterColor = stockColor(v.afterQty, v.minQty);
   const rows: Flex[] = [
@@ -477,7 +507,7 @@ export function confirmCard(v: ConfirmView): Flex {
     },
     styles: { footer: { separator: true, separatorColor: C.line } },
   };
-  return wrap(`ยืนยัน${meta.label} ${v.productName} ${fmtQty(v.qty)} ${v.unit}`, bubble);
+  return wrap(`ยืนยัน${meta.label} ${v.productName} ${fmtQty(v.qty)} ${v.unit}`, bubble, role);
 }
 
 export interface ResultView extends Omit<ConfirmView, 'token' | 'currentQty'> {
@@ -487,7 +517,7 @@ export interface ResultView extends Omit<ConfirmView, 'token' | 'currentQty'> {
   toAfterQty?: number;
 }
 
-export function resultCard(v: ResultView, liffUrl: string): Flex {
+export function resultCard(v: ResultView, liffUrl: string, role: Role = 'owner'): Flex {
   const meta = ACTION_META[v.action];
   const afterColor = stockColor(v.afterQty, v.minQty);
   const bubble: Flex = {
@@ -538,10 +568,10 @@ export function resultCard(v: ResultView, liffUrl: string): Flex {
     },
     styles: { footer: { separator: true, separatorColor: C.line } },
   };
-  return wrap(`${meta.label} ${v.productName} ${fmtQty(v.qty)} ${v.unit} สำเร็จ`, bubble);
+  return wrap(`${meta.label} ${v.productName} ${fmtQty(v.qty)} ${v.unit} สำเร็จ`, bubble, role);
 }
 
-export function lowStockCard(items: ProductWithStock[], liffUrl: string): Flex {
+export function lowStockCard(items: ProductWithStock[], liffUrl: string, role: Role = 'owner'): Flex {
   const rows = items.slice(0, 10).map((p) => ({
     type: 'box',
     layout: 'horizontal',
@@ -589,10 +619,10 @@ export function lowStockCard(items: ProductWithStock[], liffUrl: string): Flex {
       contents: [uriButton('ดูทั้งหมดในแดชบอร์ด', `${liffUrl}?tab=products&status=low`)],
     },
   };
-  return wrap('รายการสินค้าใกล้หมด', bubble);
+  return wrap('รายการสินค้าใกล้หมด', bubble, role);
 }
 
-export function historyCard(rows: MovementRow[], liffUrl: string, title = 'ความเคลื่อนไหวล่าสุด'): Flex {
+export function historyCard(rows: MovementRow[], liffUrl: string, title = 'ความเคลื่อนไหวล่าสุด', role: Role = 'owner'): Flex {
   const typeLabel: Record<string, { t: string; c: string }> = {
     issue: { t: 'เบิกออก', c: C.issue },
     receive: { t: 'รับเข้า', c: C.receive },
@@ -654,10 +684,10 @@ export function historyCard(rows: MovementRow[], liffUrl: string, title = 'ค�
       contents: [uriButton('ดูประวัติทั้งหมด', `${liffUrl}?tab=history`)],
     },
   };
-  return wrap(title, bubble);
+  return wrap(title, bubble, role);
 }
 
-export function locationsCard(rows: { name: string; code: string; items: number; units: number }[]): Flex {
+export function locationsCard(rows: { name: string; code: string; items: number; units: number }[], role: Role = 'owner'): Flex {
   const bubble: Flex = {
     type: 'bubble',
     size: 'mega',
@@ -693,12 +723,13 @@ export function locationsCard(rows: { name: string; code: string; items: number;
       })),
     },
   };
-  return wrap('รายชื่อคลัง', bubble);
+  return wrap('รายชื่อคลัง', bubble, role);
 }
 
 export function summaryCard(
   s: { productCount: number; totalUnits: number; lowCount: number; outCount: number; todayIssue: number; todayReceive: number },
   liffUrl: string,
+  role: Role = 'owner',
 ): Flex {
   const stat = (label: string, value: string, color = C.ink) => ({
     type: 'box',
@@ -752,5 +783,5 @@ export function summaryCard(
     },
     styles: { footer: { separator: true, separatorColor: C.line } },
   };
-  return wrap('ภาพรวมสต๊อก', bubble);
+  return wrap('ภาพรวมสต๊อก', bubble, role);
 }

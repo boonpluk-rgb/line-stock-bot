@@ -1,11 +1,14 @@
 import type { Context, Next } from 'hono';
-import type { Env } from '../types';
+import type { Env, Role } from '../types';
 import * as repo from '../db/repo';
+import { AppError } from '../lib/util';
 
 export interface AuthUser {
   lineUserId: string;
   name: string | null;
   picture: string | null;
+  /** ระดับสิทธิ์ — owner ทำได้ทุกอย่าง, staff ทำได้แค่ดูและสั่งเบิก */
+  role: Role;
 }
 
 interface VerifyResponse {
@@ -17,7 +20,7 @@ interface VerifyResponse {
 }
 
 /** ตรวจ ID token ที่ได้จาก liff.getIDToken() กับเซิร์ฟเวอร์ของ LINE */
-export async function verifyIdToken(env: Env, idToken: string): Promise<AuthUser | null> {
+export async function verifyIdToken(env: Env, idToken: string): Promise<Omit<AuthUser, 'role'> | null> {
   if (!env.LINE_LOGIN_CHANNEL_ID) {
     console.error('LINE_LOGIN_CHANNEL_ID ยังไม่ได้ตั้งค่า');
     return null;
@@ -44,22 +47,31 @@ export async function requireAuth(c: AppContext, next: Next): Promise<Response |
 
   // โหมดพัฒนา: ข้ามการยืนยันตัวตนเพื่อเปิดหน้า LIFF ในเบราว์เซอร์ปกติได้
   if (!token && c.env.ENVIRONMENT === 'dev' && c.env.DEV_LINE_USER_ID) {
-    const user: AuthUser = {
-      lineUserId: c.env.DEV_LINE_USER_ID,
-      name: c.env.DEV_LINE_DISPLAY_NAME ?? 'Dev User',
-      picture: null,
-    };
-    await repo.ensureUser(c.env.DB, user.lineUserId, user.name, null);
-    c.set('user', user);
+    const name = c.env.DEV_LINE_DISPLAY_NAME ?? 'Dev User';
+    const role = await repo.ensureUser(c.env.DB, c.env.DEV_LINE_USER_ID, name, null);
+    c.set('user', { lineUserId: c.env.DEV_LINE_USER_ID, name, picture: null, role });
     return next();
   }
 
   if (!token) return c.json({ error: 'กรุณาเข้าสู่ระบบผ่าน LINE' }, 401);
 
-  const user = await verifyIdToken(c.env, token);
-  if (!user) return c.json({ error: 'เซสชันหมดอายุ กรุณาเปิดแอปใหม่อีกครั้ง' }, 401);
+  const verified = await verifyIdToken(c.env, token);
+  if (!verified) return c.json({ error: 'เซสชันหมดอายุ กรุณาเปิดแอปใหม่อีกครั้ง' }, 401);
 
-  await repo.ensureUser(c.env.DB, user.lineUserId, user.name, user.picture);
-  c.set('user', user);
+  const role = await repo.ensureUser(c.env.DB, verified.lineUserId, verified.name, verified.picture);
+  c.set('user', { ...verified, role });
+  return next();
+}
+
+/** บล็อกเฉพาะผู้ดูแล — ใช้กับทุกอย่างที่แก้ข้อมูลหรือย้อนแก้สต๊อกได้ */
+export function assertOwner(user: AuthUser): void {
+  if (user.role !== 'owner') {
+    throw new AppError('คำสั่งนี้ใช้ได้เฉพาะผู้ดูแลระบบเท่านั้น', 403);
+  }
+}
+
+/** ครอบ route ที่อนุญาตเฉพาะผู้ดูแล */
+export function ownerOnly(c: AppContext, next: Next): Promise<Response | void> {
+  assertOwner(c.get('user'));
   return next();
 }

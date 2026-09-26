@@ -1,4 +1,4 @@
-import type { ActionType, Draft, DraftPayload, Env } from '../types';
+import type { ActionType, Draft, DraftPayload, Env, Role } from '../types';
 import * as repo from '../db/repo';
 import * as F from './flex';
 import { getProfile, reply, type LineMessage } from './client';
@@ -15,7 +15,10 @@ interface Ctx {
   chatKey: string;
   userId: string | null;
   userName: string | null;
+  role: Role;
 }
+
+/** พนักงานทำได้แค่เบิก — ที่เหลือเป็นหน้าที่ผู้ดูแล */
 
 /* --------------------------------------------------------- event router */
 
@@ -26,18 +29,19 @@ export async function handleEvent(env: Env, event: any): Promise<void> {
   if (!chatKey) return;
 
   let userName: string | null = null;
+  let role: Role = 'staff';
   if (source.userId) {
     const profile = await getProfile(env, source.userId);
     userName = profile?.displayName ?? null;
-    await repo.ensureUser(db, source.userId, userName, profile?.pictureUrl ?? null);
+    role = await repo.ensureUser(db, source.userId, userName, profile?.pictureUrl ?? null);
   }
 
-  const ctx: Ctx = { env, db, chatKey, userId: source.userId ?? null, userName };
+  const ctx: Ctx = { env, db, chatKey, userId: source.userId ?? null, userName, role };
 
   if (event.type === 'follow' || event.type === 'join') {
     await reply(env, event.replyToken, [
-      F.text(`สวัสดีครับ${userName ? ' คุณ' + userName : ''} 👋\nผมคือผู้ช่วยจัดการสต๊อก พิมพ์คำสั่งสั้น ๆ ได้เลย`),
-      F.helpMessage(liffUrl(env)),
+      F.text(`สวัสดีครับ${userName ? ' คุณ' + userName : ''} 👋\nผมคือผู้ช่วยจัดการสต๊อก พิมพ์คำสั่งสั้น ๆ ได้เลย`, true, role),
+      F.helpMessage(liffUrl(env), role),
     ]);
     return;
   }
@@ -59,9 +63,12 @@ export async function handleEvent(env: Env, event: any): Promise<void> {
 export async function simulate(
   env: Env,
   chatKey: string,
-  input: { text?: string; postback?: string },
+  input: { text?: string; postback?: string; as?: string },
 ): Promise<LineMessage[]> {
-  const ctx: Ctx = { env, db: env.DB, chatKey, userId: chatKey, userName: 'ผู้ทดสอบ' };
+  const userName = input.as ?? 'ผู้ทดสอบ';
+  // อ่านสิทธิ์จริงจากฐานข้อมูล เหมือนตอนใช้งานจริง
+  const role = await repo.ensureUser(env.DB, chatKey, userName, null);
+  const ctx: Ctx = { env, db: env.DB, chatKey, userId: chatKey, userName, role };
   if (input.postback !== undefined) return handlePostback(ctx, new URLSearchParams(input.postback));
   return handleText(ctx, input.text ?? '');
 }
@@ -84,21 +91,21 @@ async function handleText(ctx: Ctx, raw: string): Promise<LineMessage[]> {
 
   switch (intent.kind) {
     case 'help':
-      return [F.helpMessage(liffUrl(env))];
+      return [F.helpMessage(liffUrl(env), ctx.role)];
 
     case 'cancel': {
       await repo.clearDraft(db, ctx.chatKey);
-      return [F.text('ยกเลิกรายการแล้วครับ')];
+      return [F.text('ยกเลิกรายการแล้วครับ', true, ctx.role)];
     }
 
     case 'summary': {
       const s = await repo.getSummary(db);
-      return [F.summaryCard(s, liffUrl(env))];
+      return [F.summaryCard(s, liffUrl(env), ctx.role)];
     }
 
     case 'low': {
       const items = await repo.lowStockProducts(db);
-      return [F.lowStockCard(items, liffUrl(env))];
+      return [F.lowStockCard(items, liffUrl(env), ctx.role)];
     }
 
     case 'locations': {
@@ -115,7 +122,7 @@ async function handleText(ctx: Ctx, raw: string): Promise<LineMessage[]> {
           .first<{ items: number; units: number }>();
         rows.push({ name: l.name, code: l.code, items: agg?.items ?? 0, units: agg?.units ?? 0 });
       }
-      return [F.locationsCard(rows)];
+      return [F.locationsCard(rows, ctx.role)];
     }
 
     case 'history': {
@@ -123,29 +130,29 @@ async function handleText(ctx: Ctx, raw: string): Promise<LineMessage[]> {
         const found = await repo.searchProducts(db, intent.query, 1);
         if (found.length) {
           const rows = await repo.listMovements(db, { productId: found[0].id, limit: 10 });
-          return [F.historyCard(rows, liffUrl(env), `ประวัติ: ${found[0].name}`)];
+          return [F.historyCard(rows, liffUrl(env), `ประวัติ: ${found[0].name}`, ctx.role)];
         }
       }
       const rows = await repo.listMovements(db, { limit: 10 });
-      return [F.historyCard(rows, liffUrl(env))];
+      return [F.historyCard(rows, liffUrl(env), undefined, ctx.role)];
     }
 
     case 'barcode': {
       const product = await repo.getProductByBarcode(db, intent.code);
       if (!product) {
-        return [F.text(`ไม่พบสินค้าที่มีบาร์โค้ด ${intent.code}\nเพิ่มสินค้าใหม่ได้ที่แดชบอร์ด: ${liffUrl(env)}`)];
+        return [F.text(`ไม่พบสินค้าที่มีบาร์โค้ด ${intent.code}\nเพิ่มสินค้าใหม่ได้ที่แดชบอร์ด: ${liffUrl(env)}`, true, ctx.role)];
       }
       return [await productMessage(ctx, product.id)];
     }
 
     case 'check': {
       if (!intent.query) {
-        return [F.text('พิมพ์ชื่อสินค้าที่ต้องการเช็คต่อท้ายได้เลยครับ เช่น  เช็ค ปากกา')];
+        return [F.text('พิมพ์ชื่อสินค้าที่ต้องการเช็คต่อท้ายได้เลยครับ เช่น  เช็ค ปากกา', true, ctx.role)];
       }
       const items = await repo.searchProducts(db, intent.query, 8);
       if (items.length === 0) {
         return [
-          F.text(`ไม่พบสินค้าที่ตรงกับ "${intent.query}"\nลองพิมพ์คำสั้นลง หรือเพิ่มสินค้าใหม่ในแดชบอร์ด`),
+          F.text(`ไม่พบสินค้าที่ตรงกับ "${intent.query}"\nลองพิมพ์คำสั้นลง หรือเพิ่มสินค้าใหม่ในแดชบอร์ด`, true, ctx.role),
         ];
       }
       if (items.length === 1) return [await productMessage(ctx, items[0].id)];
@@ -156,10 +163,16 @@ async function handleText(ctx: Ctx, raw: string): Promise<LineMessage[]> {
         step: 'pick_product',
         payload: { action: 'issue', query: intent.query, view: true },
       });
-      return [F.productPicker(items, 'view', token, 'เลือกสินค้าที่ต้องการดู')];
+      return [F.productPicker(items, 'view', token, 'เลือกสินค้าที่ต้องการดู', ctx.role)];
     }
 
     case 'action': {
+      // พนักงานสั่งได้แค่เบิก — อย่าเพิ่งถามสินค้า ให้ตอบชัดเจนตั้งแต่ต้น
+      if (ctx.role !== 'owner' && intent.action !== 'issue') {
+        const label = F.ACTION_META[intent.action].label;
+        return [F.text(`🚫 คำสั่ง"${label}" ใช้ได้เฉพาะผู้ดูแลระบบครับ\n\nคุณสั่งของได้ด้วย  เบิก ปากกา 5\nถ้าต้องการเพิ่มหรือปรับยอด แจ้งผู้ดูแลได้เลยครับ`, true, ctx.role)];
+      }
+
       const payload: DraftPayload = {
         action: intent.action,
         query: intent.query,
@@ -170,18 +183,18 @@ async function handleText(ctx: Ctx, raw: string): Promise<LineMessage[]> {
       // แปลงชื่อคลังที่พิมพ์มาด้วย @ ให้เป็น id
       if (intent.locations.length) {
         const first = await repo.findLocationByKeyword(db, intent.locations[0]);
-        if (!first) return [F.text(`ไม่พบคลังชื่อ "${intent.locations[0]}" — พิมพ์ "คลัง" เพื่อดูรายชื่อคลังทั้งหมด`)];
+        if (!first) return [F.text(`ไม่พบคลังชื่อ "${intent.locations[0]}" — พิมพ์ "คลัง" เพื่อดูรายชื่อคลังทั้งหมด`, true, ctx.role)];
         payload.locationId = first.id;
         if (intent.locations[1]) {
           const second = await repo.findLocationByKeyword(db, intent.locations[1]);
-          if (!second) return [F.text(`ไม่พบคลังชื่อ "${intent.locations[1]}"`)];
+          if (!second) return [F.text(`ไม่พบคลังชื่อ "${intent.locations[1]}"`, true, ctx.role)];
           payload.toLocationId = second.id;
         }
       }
 
       if (!payload.query) {
         const meta = F.ACTION_META[intent.action];
-        return [F.text(`พิมพ์ชื่อสินค้าต่อท้ายด้วยครับ เช่น  ${meta.verb} ปากกา 5`)];
+        return [F.text(`พิมพ์ชื่อสินค้าต่อท้ายด้วยครับ เช่น  ${meta.verb} ปากกา 5`, true, ctx.role)];
       }
 
       const draft: Draft = { lineUserId: ctx.chatKey, token: randomToken(8), step: 'pick_product', payload };
@@ -189,7 +202,7 @@ async function handleText(ctx: Ctx, raw: string): Promise<LineMessage[]> {
     }
 
     default:
-      return [F.text('ไม่เข้าใจคำสั่งนี้ครับ พิมพ์ "ช่วยเหลือ" เพื่อดูวิธีใช้งาน')];
+      return [F.text('ไม่เข้าใจคำสั่งนี้ครับ พิมพ์ "ช่วยเหลือ" เพื่อดูวิธีใช้งาน', true, ctx.role)];
   }
 }
 
@@ -209,11 +222,14 @@ async function handlePostback(ctx: Ctx, data: URLSearchParams): Promise<LineMess
 
   if (a === 'cancel') {
     await repo.clearDraft(db, ctx.chatKey);
-    return [F.text('ยกเลิกรายการแล้วครับ')];
+    return [F.text('ยกเลิกรายการแล้วครับ', true, ctx.role)];
   }
 
   if (a === 'start') {
     const action = (data.get('act') ?? 'issue') as ActionType;
+    if (ctx.role !== 'owner' && action !== 'issue') {
+      return [F.text(`🚫 คำสั่ง"${F.ACTION_META[action].label}" ใช้ได้เฉพาะผู้ดูแลระบบครับ`, true, ctx.role)];
+    }
     const pid = Number(data.get('pid'));
     const draft: Draft = {
       lineUserId: ctx.chatKey,
@@ -226,7 +242,7 @@ async function handlePostback(ctx: Ctx, data: URLSearchParams): Promise<LineMess
 
   const token = data.get('t') ?? '';
   const draft = await repo.getDraft(db, ctx.chatKey, token);
-  if (!draft) return [F.text('รายการนี้หมดอายุแล้ว (เกิน 10 นาที) กรุณาเริ่มใหม่อีกครั้งครับ')];
+  if (!draft) return [F.text('รายการนี้หมดอายุแล้ว (เกิน 10 นาที) กรุณาเริ่มใหม่อีกครั้งครับ', true, ctx.role)];
 
   switch (a) {
     case 'pick_product': {
@@ -250,10 +266,15 @@ async function handlePostback(ctx: Ctx, data: URLSearchParams): Promise<LineMess
 
 async function productMessage(ctx: Ctx, productId: number): Promise<LineMessage> {
   const product = await repo.getProduct(ctx.db, productId);
-  if (!product) return F.text('ไม่พบสินค้านี้แล้วครับ');
+  if (!product) return F.text('ไม่พบสินค้านี้แล้วครับ', true, ctx.role);
   const levels = await repo.getLevels(ctx.db, productId);
   const total = levels.reduce((sum, l) => sum + l.qty, 0);
-  return F.productCard({ ...product, total_qty: total, location_count: levels.filter((l) => l.qty > 0).length }, levels, liffUrl(ctx.env));
+  return F.productCard(
+    { ...product, total_qty: total, location_count: levels.filter((l) => l.qty > 0).length },
+    levels,
+    liffUrl(ctx.env),
+    ctx.role,
+  );
 }
 
 /** เดินหน้าไปยังขั้นตอนถัดไปของร่างรายการ */
@@ -262,17 +283,23 @@ async function advance(ctx: Ctx, draft: Draft): Promise<LineMessage[]> {
   const p = draft.payload;
   const meta = F.ACTION_META[p.action];
 
+  // กันพนักงานที่มีร่างค้างอยู่จากก่อนเปลี่ยนสิทธิ์
+  if (ctx.role !== 'owner' && p.action !== 'issue') {
+    await repo.clearDraft(db, ctx.chatKey);
+    return [F.text(`🚫 คำสั่ง"${meta.label}" ใช้ได้เฉพาะผู้ดูแลระบบครับ\n\nคุณสั่งของได้ด้วย  เบิก ปากกา 5`, true, ctx.role)];
+  }
+
   // 1) สินค้า
   if (!p.productId) {
     const items = await repo.searchProducts(db, p.query, 8);
     if (items.length === 0) {
       await repo.clearDraft(db, ctx.chatKey);
-      return [F.text(`ไม่พบสินค้าที่ตรงกับ "${p.query}"\nลองพิมพ์คำสั้นลง หรือเพิ่มสินค้าใหม่ในแดชบอร์ด`)];
+      return [F.text(`ไม่พบสินค้าที่ตรงกับ "${p.query}"\nลองพิมพ์คำสั้นลง หรือเพิ่มสินค้าใหม่ในแดชบอร์ด`, true, ctx.role)];
     }
     if (items.length > 1) {
       draft.step = 'pick_product';
       await repo.saveDraft(db, draft);
-      return [F.productPicker(items, p.view ? 'view' : p.action, draft.token)];
+      return [F.productPicker(items, p.view ? 'view' : p.action, draft.token, undefined, ctx.role)];
     }
     p.productId = items[0].id;
   }
@@ -286,7 +313,7 @@ async function advance(ctx: Ctx, draft: Draft): Promise<LineMessage[]> {
   const product = await repo.getProduct(db, p.productId);
   if (!product) {
     await repo.clearDraft(db, ctx.chatKey);
-    return [F.text('ไม่พบสินค้านี้แล้วครับ')];
+    return [F.text('ไม่พบสินค้านี้แล้วครับ', true, ctx.role)];
   }
   const levels = await repo.getLevels(db, product.id);
 
@@ -295,14 +322,14 @@ async function advance(ctx: Ctx, draft: Draft): Promise<LineMessage[]> {
     const candidates = p.action === 'issue' || p.action === 'transfer' ? levels.filter((l) => l.qty > 0) : levels;
     if (candidates.length === 0) {
       await repo.clearDraft(db, ctx.chatKey);
-      return [F.text(`"${product.name}" ไม่มีคงเหลือในคลังใดเลย จึงเบิกไม่ได้ครับ`)];
+      return [F.text(`"${product.name}" ไม่มีคงเหลือในคลังใดเลย จึงเบิกไม่ได้ครับ`, true, ctx.role)];
     }
     if (candidates.length === 1) {
       p.locationId = candidates[0].location_id;
     } else {
       draft.step = 'pick_location';
       await repo.saveDraft(db, draft);
-      return [F.locationPicker(product.name, product.unit, candidates, p.action, draft.token, 'from')];
+      return [F.locationPicker(product.name, product.unit, candidates, p.action, draft.token, 'from', ctx.role)];
     }
   }
 
@@ -311,14 +338,14 @@ async function advance(ctx: Ctx, draft: Draft): Promise<LineMessage[]> {
     const candidates = levels.filter((l) => l.location_id !== p.locationId);
     if (candidates.length === 0) {
       await repo.clearDraft(db, ctx.chatKey);
-      return [F.text('ต้องมีคลังอย่างน้อย 2 แห่งจึงจะย้ายสินค้าได้ครับ')];
+      return [F.text('ต้องมีคลังอย่างน้อย 2 แห่งจึงจะย้ายสินค้าได้ครับ', true, ctx.role)];
     }
     if (candidates.length === 1) {
       p.toLocationId = candidates[0].location_id;
     } else {
       draft.step = 'pick_to_location';
       await repo.saveDraft(db, draft);
-      return [F.locationPicker(product.name, product.unit, candidates, p.action, draft.token, 'to')];
+      return [F.locationPicker(product.name, product.unit, candidates, p.action, draft.token, 'to', ctx.role)];
     }
   }
 
@@ -332,6 +359,8 @@ async function advance(ctx: Ctx, draft: Draft): Promise<LineMessage[]> {
         `${meta.icon} ${meta.label} — ${product.name}\n` +
           `คลัง: ${loc?.name ?? '-'} (คงเหลือ ${fmtQty(loc?.qty ?? 0)} ${product.unit})\n\n` +
           `พิมพ์จำนวนที่ต้องการ${p.action === 'adjust' ? ' (ยอดที่นับได้จริง)' : ''} เป็นตัวเลขได้เลยครับ`,
+        true,
+        ctx.role,
       ),
     ];
   }
@@ -359,7 +388,7 @@ async function advance(ctx: Ctx, draft: Draft): Promise<LineMessage[]> {
       minQty: product.min_qty,
       note: p.note,
       token: draft.token,
-    }),
+    }, ctx.role),
   ];
 }
 
@@ -370,7 +399,7 @@ async function commit(ctx: Ctx, draft: Draft): Promise<LineMessage[]> {
   const product = await repo.getProduct(db, p.productId!);
   if (!product || !p.locationId || p.qty === undefined) {
     await repo.clearDraft(db, ctx.chatKey);
-    return [F.text('ข้อมูลรายการไม่ครบ กรุณาเริ่มใหม่ครับ')];
+    return [F.text('ข้อมูลรายการไม่ครบ กรุณาเริ่มใหม่ครับ', true, ctx.role)];
   }
 
   const actor = { lineUserId: ctx.userId, name: ctx.userName, source: 'line' as const };
@@ -404,12 +433,13 @@ async function commit(ctx: Ctx, draft: Draft): Promise<LineMessage[]> {
           ref: result.ref,
         },
         liffUrl(env),
+        ctx.role,
       ),
     ];
   } catch (err) {
     await repo.clearDraft(db, ctx.chatKey);
     const message = err instanceof AppError ? err.message : 'บันทึกรายการไม่สำเร็จ กรุณาลองใหม่';
     console.error('commit error', err);
-    return [F.text(`❌ ${message}`)];
+    return [F.text(`❌ ${message}`, true, ctx.role)];
   }
 }

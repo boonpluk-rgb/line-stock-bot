@@ -1,25 +1,79 @@
-import type { Actor, Draft, DraftPayload, DraftStep, Location, MovementType, Product } from '../types';
+import type { Actor, Draft, DraftPayload, DraftStep, Location, MovementType, Product, Role, UserRow } from '../types';
 import { AppError, makeRef, norm, parseNumber } from '../lib/util';
 
 /* ------------------------------------------------------------------ users */
 
+/**
+ * บันทึก/อัปเดตผู้ใช้ แล้วคืนระดับสิทธิ์กลับมา
+ * ใช้ RETURNING เพื่อไม่ต้องเปิดคิวรีเพิ่ม (ทำงานทุกครั้งที่มีคนเข้าใช้ระบบ)
+ */
 export async function ensureUser(
   db: D1Database,
   lineUserId: string,
   displayName?: string | null,
   pictureUrl?: string | null,
-): Promise<void> {
-  await db
+): Promise<Role> {
+  const row = await db
     .prepare(
       `INSERT INTO users (line_user_id, display_name, picture_url)
        VALUES (?, ?, ?)
        ON CONFLICT(line_user_id) DO UPDATE SET
          display_name = COALESCE(excluded.display_name, users.display_name),
          picture_url  = COALESCE(excluded.picture_url, users.picture_url),
-         last_seen_at = datetime('now')`,
+         last_seen_at = datetime('now')
+       RETURNING role`,
     )
     .bind(lineUserId, displayName ?? null, pictureUrl ?? null)
-    .run();
+    .first<{ role: Role }>();
+  return row?.role === 'owner' ? 'owner' : 'staff';
+}
+
+/** ระดับสิทธิ์ของผู้ใช้ (ถ้าไม่เคยเข้าใช้ระบบ = พนักงาน) */
+export async function getRole(db: D1Database, lineUserId: string | null): Promise<Role> {
+  if (!lineUserId) return 'staff';
+  const row = await db.prepare('SELECT role FROM users WHERE line_user_id = ?').bind(lineUserId).first<{ role: Role }>();
+  return row?.role === 'owner' ? 'owner' : 'staff';
+}
+
+/** รายชื่อผู้ใช้ทุกคน (หน้าตั้งค่า) — เรียงตามเวลาที่เข้าล่าสุด */
+export async function listUsers(db: D1Database, limit = 200): Promise<UserRow[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT id, line_user_id, display_name, role, created_at, last_seen_at
+       FROM users ORDER BY last_seen_at DESC LIMIT ?`,
+    )
+    .bind(limit)
+    .all<UserRow>();
+  return results ?? [];
+}
+
+/** เปลี่ยนสิทธิ์ของผู้ใช้ — กันไม่ให้ผู้ดูแลคนสุดท้ายถูกลดสิทธิ์จนไม่มีใครดูแลได้ */
+export async function setUserRole(
+  db: D1Database,
+  userId: number,
+  role: Role,
+  actor: { lineUserId: string; role: Role },
+): Promise<Role> {
+  if (actor.role !== 'owner') throw new AppError('เปลี่ยนสิทธิ์ได้เฉพาะผู้ดูแลเท่านั้น', 403);
+  const target = await db
+    .prepare('SELECT id, line_user_id, role FROM users WHERE id = ?')
+    .bind(userId)
+    .first<{ id: number; line_user_id: string; role: Role }>();
+  if (!target) throw new AppError('ไม่พบผู้ใช้คนนี้', 404);
+  if (target.role === role) return role;
+
+  // กันไม่ให้ถอดสิทธิ์ตัวเองจนหลุดมือ (คนอื่นต้องเป็นผู้ถอดให้)
+  if (target.line_user_id === actor.lineUserId) {
+    throw new AppError('ถอดสิทธิ์ตัวเองไม่ได้ กรุณาให้ผู้ดูแลคนอื่นเป็นผู้ถอดสิทธิ์คุณแทน');
+  }
+
+  if (role === 'staff') {
+    const row = await db.prepare(`SELECT COUNT(*) AS owners FROM users WHERE role = 'owner'`).first<{ owners: number }>();
+    if ((row?.owners ?? 0) <= 1) throw new AppError('ต้องมีผู้ดูแลอย่างน้อย 1 คนเสมอ', 400);
+  }
+
+  await db.prepare('UPDATE users SET role = ? WHERE id = ?').bind(role, userId).run();
+  return role;
 }
 
 /* -------------------------------------------------------------- locations */
@@ -53,9 +107,21 @@ export async function findLocationByKeyword(db: D1Database, keyword: string): Pr
 }
 
 export async function createLocation(db: D1Database, code: string, name: string, isDefault = false): Promise<Location> {
+  const normalized = code.trim().toUpperCase();
+  const dup = await db
+    .prepare('SELECT id, active FROM locations WHERE code = ?')
+    .bind(normalized)
+    .first<{ id: number; active: number }>();
+  if (dup) {
+    throw new AppError(
+      dup.active
+        ? `รหัสคลัง "${normalized}" ถูกใช้ไปแล้ว กรุณาใช้รหัสอื่น`
+        : `รหัสคลัง "${normalized}" เคยถูกลบไปแล้ว กรุณาใช้รหัสอื่น`,
+    );
+  }
   const row = await db
     .prepare('INSERT INTO locations (code, name, is_default) VALUES (?, ?, ?) RETURNING *')
-    .bind(code.trim().toUpperCase(), name.trim(), isDefault ? 1 : 0)
+    .bind(normalized, name.trim(), isDefault ? 1 : 0)
     .first<Location>();
   if (isDefault) {
     await db.prepare('UPDATE locations SET is_default = 0 WHERE id != ?').bind(row!.id).run();
@@ -72,6 +138,13 @@ export async function updateLocation(db: D1Database, id: number, patch: Partial<
     is_default: patch.is_default ?? current.is_default,
     active: patch.active ?? current.active,
   };
+  if (next.code !== current.code) {
+    const dup = await db
+      .prepare('SELECT id FROM locations WHERE code = ? AND id != ?')
+      .bind(next.code, id)
+      .first<{ id: number }>();
+    if (dup) throw new AppError(`รหัสคลัง "${next.code}" ถูกใช้ไปแล้ว กรุณาใช้รหัสอื่น`);
+  }
   await db
     .prepare('UPDATE locations SET code = ?, name = ?, is_default = ?, active = ? WHERE id = ?')
     .bind(next.code, next.name, next.is_default, next.active, id)

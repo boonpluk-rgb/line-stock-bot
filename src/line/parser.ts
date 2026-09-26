@@ -14,19 +14,41 @@ export type Intent =
   | { kind: 'number'; value: number }
   | { kind: 'unknown'; text: string };
 
-const KEYWORDS: { intent: ActionType | 'check' | 'low' | 'history' | 'locations' | 'summary' | 'help' | 'cancel'; words: string[] }[] = [
-  { intent: 'issue', words: ['เบิก', 'เบิกของ', 'ตัดสต๊อก', 'จ่ายออก', 'จ่าย', 'issue', 'out'] },
-  { intent: 'receive', words: ['รับเข้า', 'รับของ', 'รับ', 'เพิ่มสต๊อก', 'เติม', 'receive', 'in'] },
-  { intent: 'adjust', words: ['ปรับ', 'ปรับยอด', 'ปรับสต๊อก', 'นับสต๊อก', 'นับ', 'adjust'] },
-  { intent: 'transfer', words: ['ย้าย', 'โอน', 'ย้ายคลัง', 'transfer', 'move'] },
-  { intent: 'check', words: ['เช็ค', 'เช็ก', 'ตรวจ', 'ค้นหา', 'หา', 'สต๊อก', 'สต็อก', 'คงเหลือ', 'check', 'stock', 'find'] },
-  { intent: 'low', words: ['ใกล้หมด', 'ของใกล้หมด', 'เตือน', 'ต่ำกว่าขั้นต่ำ', 'low', 'alert'] },
-  { intent: 'history', words: ['ประวัติ', 'รายการล่าสุด', 'ล่าสุด', 'history', 'log'] },
-  { intent: 'locations', words: ['คลัง', 'คลังสินค้า', 'สาขา', 'ที่เก็บ', 'locations', 'warehouse'] },
-  { intent: 'summary', words: ['สรุป', 'ภาพรวม', 'รายงาน', 'dashboard', 'summary'] },
-  { intent: 'help', words: ['ช่วยเหลือ', 'วิธีใช้', 'เมนู', 'คำสั่ง', 'help', 'menu', 'start', '?'] },
-  { intent: 'cancel', words: ['ยกเลิก', 'ยุติ', 'cancel', 'ไม่เอา'] },
+type IntentName = ActionType | 'check' | 'low' | 'history' | 'locations' | 'summary' | 'help' | 'cancel';
+
+interface KeywordGroup {
+  intent: IntentName;
+  /**
+   * คำที่ต้องเว้นวรรคถึงจะแยกได้ — เก็บคำสั้น ๆ ที่อาจเป็นส่วนหนึ่งของชื่อสินค้าไว้ตรงนี้
+   * เช่น "หา" (หางคู่ตัด), "เติม" (เติมพิมพ์), "นับ", "สต๊อก", "in"
+   */
+  words: string[];
+  /**
+   * คำที่ยาว/เฉพาะเจาะจงพอ จะเดาว่าเป็นคำสั่งแม้ผู้ใช้พิมพ์ติดกัน
+   * เช่น "เบิกปากกา5" ไม่ต้องมีช่องว่างก็ต้องออกมาเป็นคำสั่ง "เบิก"
+   */
+  loose?: string[];
+}
+
+const KEYWORDS: KeywordGroup[] = [
+  { intent: 'issue', words: ['จ่าย', 'issue', 'out'], loose: ['เบิก', 'เบิกของ', 'ตัดสต๊อก', 'จ่ายออก'] },
+  { intent: 'receive', words: ['เติม', 'receive', 'in'], loose: ['รับเข้า', 'รับของ', 'รับ', 'เพิ่มสต๊อก', 'เติมสต๊อก'] },
+  { intent: 'adjust', words: ['adjust'], loose: ['ปรับ', 'ปรับยอด', 'ปรับสต๊อก', 'นับสต๊อก', 'นับจริง', 'นับ'] },
+  { intent: 'transfer', words: ['transfer', 'move'], loose: ['ย้าย', 'ย้ายคลัง', 'โอน', 'โอนคลัง'] },
+  { intent: 'check', words: ['หา', 'สต๊อก', 'สต็อก', 'คงเหลือ', 'check', 'stock', 'find'], loose: ['เช็ค', 'เช็ก', 'ตรวจสอบ', 'ตรวจ', 'ค้นหา'] },
+  { intent: 'low', words: ['เตือน', 'low', 'alert'], loose: ['ใกล้หมด', 'ของใกล้หมด', 'ต่ำกว่า'] },
+  { intent: 'history', words: ['history', 'log'], loose: ['ประวัติ', 'รายการล่าสุด', 'รายการ', 'ล่าสุด'] },
+  { intent: 'locations', words: ['locations', 'warehouse'], loose: ['คลังสินค้า', 'คลัง', 'สาขา', 'ที่เก็บ'] },
+  { intent: 'summary', words: ['dashboard', 'summary'], loose: ['สรุป', 'ภาพรวม', 'รายงาน'] },
+  { intent: 'help', words: ['help', 'menu', 'start', '?'], loose: ['ช่วยเหลือ', 'วิธีใช้', 'เมนู', 'คำสั่ง'] },
+  { intent: 'cancel', words: ['cancel'], loose: ['ยกเลิก', 'ยุติ', 'ไม่เอา'] },
 ];
+
+/** รวมคำสั่งทั้งหมดเรียงจากยาวไปสั้น เพื่อให้ "รับเข้า" ชนะ "รับ" */
+const CANDIDATES = KEYWORDS.flatMap((k) => [
+  ...(k.loose ?? []).map((w) => ({ intent: k.intent, word: w, loose: true })),
+  ...k.words.map((w) => ({ intent: k.intent, word: w, loose: false })),
+]).sort((a, b) => b.word.length - a.word.length);
 
 const ACTIONS: ActionType[] = ['issue', 'receive', 'adjust', 'transfer'];
 
@@ -44,16 +66,17 @@ export function parse(raw: string): Intent {
   }
 
   const lower = input.toLowerCase();
-  let matched: (typeof KEYWORDS)[number] | undefined;
+  let matched: IntentName | undefined;
   let rest = '';
-  for (const k of KEYWORDS) {
-    // เรียงคำยาวก่อน เพื่อให้ "รับเข้า" ชนะ "รับ"
-    const sorted = [...k.words].sort((a, b) => b.length - a.length);
-    for (const w of sorted) {
-      if (lower === w) { matched = k; rest = ''; break; }
-      if (lower.startsWith(w + ' ')) { matched = k; rest = input.slice(w.length).trim(); break; }
+  for (const c of CANDIDATES) {
+    if (lower === c.word) { matched = c.intent; rest = ''; break; }
+    if (lower.startsWith(c.word + ' ')) { matched = c.intent; rest = input.slice(c.word.length).trim(); break; }
+    // คำในกลุ่ม loose เดาได้แม้ไม่เว้นวรรค เช่น "เบิกปากกา5"
+    if (c.loose && lower.startsWith(c.word) && c.word.length < input.length) {
+      matched = c.intent;
+      rest = input.slice(c.word.length).trim();
+      break;
     }
-    if (matched) break;
   }
 
   if (!matched) {
@@ -61,7 +84,7 @@ export function parse(raw: string): Intent {
     return { kind: 'check', query: input };
   }
 
-  switch (matched.intent) {
+  switch (matched) {
     case 'help': return { kind: 'help' };
     case 'cancel': return { kind: 'cancel' };
     case 'low': return { kind: 'low' };
@@ -72,7 +95,7 @@ export function parse(raw: string): Intent {
     default: break;
   }
 
-  const action = matched.intent as ActionType;
+  const action = matched as ActionType;
   if (!ACTIONS.includes(action)) return { kind: 'unknown', text: input };
 
   // แยกหมายเหตุหลัง #
@@ -103,6 +126,20 @@ export function parse(raw: string): Intent {
       qty = n;
       tokens.splice(i, 1);
       break;
+    }
+  }
+
+  // คนไทยมักพิมพ์ติดกันไม่เว้นวรรค เช่น "เบิกปากกา5" → ชื่อ "ปากกา" จำนวน 5
+  // เงื่อนไข: ต้องเป็นคำเดียวทั้งหมด และตัวเลขต้องต่อหลังตัวอักษรไทย
+  // (กันไม่ให้กินรหัสสินค้าที่มีตัวเลขผสม เช่น "เบิกA4" หรือ "เบิกกระดาษ A410")
+  if (qty === undefined && tokens.length === 1) {
+    const m = tokens[0].match(/^(.*[฀-๿])\s*([0-9๐-๙][0-9๐-๙.,]*)$/);
+    if (m) {
+      const n = parseNumber(m[2]);
+      if (n !== null) {
+        qty = n;
+        tokens[0] = m[1].trim();
+      }
     }
   }
 
